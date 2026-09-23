@@ -5,8 +5,7 @@ from datetime import datetime
 from typing import Optional, List, Tuple
 from contextlib import contextmanager
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -105,7 +104,7 @@ def episode_sort_key(episode: Optional[str]) -> Tuple[int, int, str]:
 def get_connection():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL تنظیم نشده است.")
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = psycopg.connect(DATABASE_URL)
     try:
         yield conn
         conn.commit()
@@ -152,7 +151,7 @@ def add_course(name: str, teacher: str = None) -> bool:
                 (name.strip(), teacher, datetime.now().isoformat()),
             )
         return True
-    except psycopg2.IntegrityError:
+    except psycopg.errors.IntegrityError:
         return False
 
 
@@ -165,7 +164,7 @@ def update_course(course_id: int, name: str) -> bool:
                 (normalize_digits(name.strip()), course_id),
             )
             return c.rowcount > 0
-    except psycopg2.IntegrityError:
+    except psycopg.errors.IntegrityError:
         return False
 
 
@@ -212,7 +211,7 @@ def add_video(course_id: int, title: str, namasha_url: str, episode: str = None)
                 (course_id, title, episode, namasha_url.strip(), datetime.now().isoformat()),
             )
         return True
-    except psycopg2.IntegrityError:
+    except psycopg.errors.IntegrityError:
         return False
 
 
@@ -239,7 +238,7 @@ def update_video(video_id: int, title: str = None, episode: str = None, namasha_
             c = conn.cursor()
             c.execute(f"UPDATE videos SET {', '.join(fields)} WHERE id = %s", values)
             return c.rowcount > 0
-    except psycopg2.IntegrityError:
+    except psycopg.errors.IntegrityError:
         return False
 
 
