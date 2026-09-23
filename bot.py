@@ -1,8 +1,9 @@
 import os
 import re
 import sqlite3
+import logging
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Tuple
 
 from dotenv import load_dotenv
 from telegram import (
@@ -22,31 +23,81 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.constants import ParseMode
+from telegram.error import BadRequest
 
 load_dotenv()
 
-# ==================== تنظیمات ====================
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
-# وضعیت‌های مکالمه ادمین
+PAGE_SIZE = 10
+
 (
-    ADMIN_MENU,
     ADD_COURSE_NAME,
     ADD_VIDEO_COURSE,
     ADD_VIDEO_TITLE,
     ADD_VIDEO_URL,
-    DELETE_CONFIRM,
-) = range(6)
+    EDIT_VIDEO_SELECT,
+    EDIT_VIDEO_FIELD,
+    EDIT_VIDEO_VALUE,
+    DELETE_VIDEO_SELECT,
+    DELETE_VIDEO_CONFIRM,
+) = range(9)
 
 DB_PATH = "database.db"
+PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 
 
-# ==================== دیتابیس ====================
+def normalize_digits(text: str) -> str:
+    if not text:
+        return text
+    return text.translate(PERSIAN_DIGITS)
+
+
+def safe_text(text: str) -> str:
+    if not text:
+        return ""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def extract_episode(title: str) -> Optional[str]:
+    title = normalize_digits(title)
+    match = re.search(
+        r"(?:قسمت|جلسه|part|episode)\s*([0-9]+(?:[.-][0-9]+)?)",
+        title,
+        re.IGNORECASE,
+    )
+    if match:
+        return match.group(1)
+    match2 = re.search(r"\b([0-9]+)\s*$", title.strip())
+    if match2:
+        return match2.group(1)
+    return None
+
+
+def episode_sort_key(episode: Optional[str]) -> Tuple[int, int, str]:
+    if not episode:
+        return (10**9, 0, "")
+    ep = normalize_digits(str(episode))
+    parts = re.split(r"[.-]", ep)
+    try:
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        return (major, minor, ep)
+    except ValueError:
+        return (10**9, 0, ep)
+
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS courses (
@@ -57,7 +108,6 @@ def init_db():
         )
         """
     )
-
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS videos (
@@ -71,7 +121,6 @@ def init_db():
         )
         """
     )
-
     conn.commit()
     conn.close()
 
@@ -95,7 +144,7 @@ def add_course(name: str, teacher: str = None) -> bool:
         return False
 
 
-def get_all_courses():
+def get_all_courses() -> List[Tuple]:
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT id, name, teacher FROM courses ORDER BY name")
@@ -115,6 +164,8 @@ def get_course_by_id(course_id: int):
 
 def add_video(course_id: int, title: str, namasha_url: str, episode: str = None) -> bool:
     try:
+        title = normalize_digits(title.strip())
+        episode = normalize_digits(episode) if episode else extract_episode(title)
         conn = get_connection()
         c = conn.cursor()
         c.execute(
@@ -122,7 +173,7 @@ def add_video(course_id: int, title: str, namasha_url: str, episode: str = None)
             INSERT INTO videos (course_id, title, episode, namasha_url, created_at)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (course_id, title.strip(), episode, namasha_url.strip(), datetime.now().isoformat()),
+            (course_id, title, episode, namasha_url.strip(), datetime.now().isoformat()),
         )
         conn.commit()
         conn.close()
@@ -131,41 +182,70 @@ def add_video(course_id: int, title: str, namasha_url: str, episode: str = None)
         return False
 
 
-def get_videos_by_course(course_id: int):
+def update_video(video_id: int, title: str = None, episode: str = None, namasha_url: str = None) -> bool:
+    conn = get_connection()
+    c = conn.cursor()
+    fields = []
+    values = []
+    if title is not None:
+        title = normalize_digits(title.strip())
+        fields.append("title = ?")
+        values.append(title)
+        if episode is None:
+            episode = extract_episode(title)
+    if episode is not None:
+        fields.append("episode = ?")
+        values.append(normalize_digits(str(episode)))
+    if namasha_url is not None:
+        fields.append("namasha_url = ?")
+        values.append(namasha_url.strip())
+    if not fields:
+        conn.close()
+        return False
+    values.append(video_id)
+    try:
+        c.execute(f"UPDATE videos SET {', '.join(fields)} WHERE id = ?", values)
+        conn.commit()
+        ok = c.rowcount > 0
+        conn.close()
+        return ok
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False
+
+
+def get_videos_by_course(course_id: int) -> List[Tuple]:
     conn = get_connection()
     c = conn.cursor()
     c.execute(
-        """
-        SELECT id, title, episode, namasha_url
-        FROM videos
-        WHERE course_id = ?
-        ORDER BY CAST(episode AS INTEGER), title
-        """,
+        "SELECT id, title, episode, namasha_url FROM videos WHERE course_id = ?",
         (course_id,),
     )
     rows = c.fetchall()
     conn.close()
-    return rows
+    return sorted(rows, key=lambda r: episode_sort_key(r[2]))
 
 
-def search_videos(query: str):
+def search_videos(query: str) -> List[Tuple]:
     conn = get_connection()
     c = conn.cursor()
-    like = f"%{query}%"
+    q = normalize_digits(query.strip())
+    like = f"%{q}%"
     c.execute(
         """
         SELECT v.id, v.title, v.episode, v.namasha_url, c.name
         FROM videos v
         JOIN courses c ON v.course_id = c.id
-        WHERE v.title LIKE ? OR c.name LIKE ? OR v.episode LIKE ?
-        ORDER BY c.name, CAST(v.episode AS INTEGER)
-        LIMIT 30
+        WHERE v.title LIKE ? OR c.name LIKE ?
+           OR IFNULL(v.episode,'') LIKE ? OR IFNULL(c.teacher,'') LIKE ?
+        ORDER BY c.name
+        LIMIT 50
         """,
-        (like, like, like),
+        (like, like, like, like),
     )
     rows = c.fetchall()
     conn.close()
-    return rows
+    return sorted(rows, key=lambda r: (r[4], episode_sort_key(r[2])))
 
 
 def get_video_by_id(video_id: int):
@@ -173,7 +253,7 @@ def get_video_by_id(video_id: int):
     c = conn.cursor()
     c.execute(
         """
-        SELECT v.id, v.title, v.episode, v.namasha_url, c.name
+        SELECT v.id, v.title, v.episode, v.namasha_url, c.name, v.course_id
         FROM videos v
         JOIN courses c ON v.course_id = c.id
         WHERE v.id = ?
@@ -185,12 +265,14 @@ def get_video_by_id(video_id: int):
     return row
 
 
-def delete_video(video_id: int):
+def delete_video(video_id: int) -> bool:
     conn = get_connection()
     c = conn.cursor()
     c.execute("DELETE FROM videos WHERE id = ?", (video_id,))
     conn.commit()
+    ok = c.rowcount > 0
     conn.close()
+    return ok
 
 
 def count_stats():
@@ -208,7 +290,6 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-# ==================== کیبوردها ====================
 def main_keyboard(is_admin_user: bool = False):
     buttons = [
         [KeyboardButton("📚 لیست دروس"), KeyboardButton("🔍 جستجو")],
@@ -223,159 +304,234 @@ def admin_keyboard():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("➕ افزودن درس"), KeyboardButton("🎬 افزودن ویدیو")],
+            [KeyboardButton("✏️ ویرایش ویدیو"), KeyboardButton("🗑 حذف ویدیو")],
             [KeyboardButton("📊 آمار"), KeyboardButton("🔙 بازگشت به منوی اصلی")],
         ],
         resize_keyboard=True,
     )
 
 
-# ==================== هندلرها ====================
+def paginate_buttons(items, page: int, page_size: int, prefix: str, back_data: str = None):
+    total = len(items)
+    start = page * page_size
+    end = start + page_size
+    page_items = items[start:end]
+    buttons = list(page_items)
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"{prefix}_page_{page-1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"{prefix}_page_{page+1}"))
+    if nav:
+        buttons.append(nav)
+    if back_data:
+        buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data=back_data)])
+    return InlineKeyboardMarkup(buttons), total, start, end
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "⚠️ مشکلی پیش آمد. لطفاً دوباره امتحان کنید."
+            )
+    except Exception:
+        pass
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = (
-        f"سلام {user.first_name} 👋\n\n"
-        "به ربات **آرشیو ویدیوهای دانشکده ریاضی** خوش آمدید.\n\n"
+        f"سلام {safe_text(user.first_name)} 👋\n\n"
+        "به ربات <b>آرشیو ویدیوهای دانشکده ریاضی</b> خوش آمدید.\n\n"
         "از منوی زیر می‌توانید دروس را مشاهده کنید یا جستجو کنید."
     )
     await update.message.reply_text(
         text,
         reply_markup=main_keyboard(is_admin(user.id)),
-        parse_mode="Markdown",
+        parse_mode=ParseMode.HTML,
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "📖 **راهنمای استفاده**\n\n"
-        "• روی **📚 لیست دروس** بزنید تا دروس را ببینید.\n"
+        "📖 <b>راهنمای استفاده</b>\n\n"
+        "• روی <b>📚 لیست دروس</b> بزنید تا دروس را ببینید.\n"
         "• بعد از انتخاب درس، قسمت‌ها را مشاهده کنید.\n"
         "• با زدن روی هر قسمت، لینک نماشا برایتان ارسال می‌شود.\n"
-        "• می‌توانید با **🔍 جستجو** نام درس یا قسمت را پیدا کنید.\n\n"
+        "• می‌توانید با <b>🔍 جستجو</b> نام درس یا قسمت را پیدا کنید.\n\n"
         "ویدیوها روی سایت نماشا میزبانی می‌شوند."
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
-async def show_courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_courses_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0, edit: bool = False):
     courses = get_all_courses()
     if not courses:
-        await update.message.reply_text(
-            "هنوز هیچ درسی اضافه نشده است.\n"
-            "اگر ادمین هستید، از پنل مدیریت درس اضافه کنید."
-        )
+        msg = "هنوز هیچ درسی اضافه نشده است."
+        if edit and update.callback_query:
+            await update.callback_query.edit_message_text(msg)
+        else:
+            await update.effective_message.reply_text(msg)
         return
 
-    buttons = []
+    items = []
     for course_id, name, teacher in courses:
         label = f"📘 {name}"
         if teacher:
             label += f" ({teacher})"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"course_{course_id}")])
+        items.append([InlineKeyboardButton(label[:60], callback_data=f"course_{course_id}")])
 
-    await update.message.reply_text(
-        "📚 **لیست دروس**\nیکی را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode="Markdown",
+    markup, total, start, end = paginate_buttons(items, page, PAGE_SIZE, "courses")
+    text = (
+        f"📚 <b>لیست دروس</b>\n"
+        f"نمایش {start+1} تا {min(end, total)} از {total}\n"
+        "یکی را انتخاب کنید:"
     )
 
+    if edit and update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(
+                text, reply_markup=markup, parse_mode=ParseMode.HTML
+            )
+        except BadRequest:
+            await update.callback_query.answer()
+    else:
+        await update.effective_message.reply_text(
+            text, reply_markup=markup, parse_mode=ParseMode.HTML
+        )
 
-async def course_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def show_courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_courses_page(update, context, page=0, edit=False)
+
+
+async def courses_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    page = int(query.data.split("_")[-1])
+    await show_courses_page(update, context, page=page, edit=True)
 
-    course_id = int(query.data.split("_")[1])
+
+async def show_course_videos_page(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    course_id: int,
+    page: int = 0,
+    edit: bool = False,
+):
     course = get_course_by_id(course_id)
     if not course:
-        await query.edit_message_text("درس پیدا نشد.")
+        msg = "درس پیدا نشد."
+        if edit and update.callback_query:
+            await update.callback_query.edit_message_text(msg)
+        else:
+            await update.effective_message.reply_text(msg)
         return
 
     _, name, teacher = course
     videos = get_videos_by_course(course_id)
 
     if not videos:
-        text = f"📘 **{name}**\n\nهنوز ویدیویی برای این درس ثبت نشده است."
-        await query.edit_message_text(text, parse_mode="Markdown")
+        text = f"📘 <b>{safe_text(name)}</b>\n\nهنوز ویدیویی برای این درس ثبت نشده است."
+        buttons = [[InlineKeyboardButton("🔙 بازگشت به دروس", callback_data="back_courses")]]
+        markup = InlineKeyboardMarkup(buttons)
+        if edit and update.callback_query:
+            await update.callback_query.edit_message_text(
+                text, reply_markup=markup, parse_mode=ParseMode.HTML
+            )
+        else:
+            await update.effective_message.reply_text(
+                text, reply_markup=markup, parse_mode=ParseMode.HTML
+            )
         return
 
-    text = f"📘 **{name}**"
-    if teacher:
-        text += f"\n👨‍🏫 {teacher}"
-    text += f"\n\nتعداد قسمت‌ها: {len(videos)}\nیکی را انتخاب کنید:"
-
-    buttons = []
+    items = []
     for vid_id, title, episode, url in videos:
-        label = f"🎬 {title}"
         if episode:
-            label = f"🎬 قسمت {episode} — {title}" if title != f"قسمت {episode}" else f"🎬 قسمت {episode}"
-        buttons.append([InlineKeyboardButton(label[:60], callback_data=f"video_{vid_id}")])
+            label = f"🎬 قسمت {episode} — {title}"
+        else:
+            label = f"🎬 {title}"
+        items.append([InlineKeyboardButton(label[:60], callback_data=f"video_{vid_id}")])
 
-    buttons.append([InlineKeyboardButton("🔙 بازگشت به دروس", callback_data="back_courses")])
-
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode="Markdown",
+    markup, total, start, end = paginate_buttons(
+        items, page, PAGE_SIZE, f"cv_{course_id}", back_data="back_courses"
     )
+
+    text = f"📘 <b>{safe_text(name)}</b>"
+    if teacher:
+        text += f"\n👨‍🏫 {safe_text(teacher)}"
+    text += (
+        f"\n\nتعداد قسمت‌ها: {total}\n"
+        f"نمایش {start+1} تا {min(end, total)}\n"
+        "یکی را انتخاب کنید:"
+    )
+
+    if edit and update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(
+                text, reply_markup=markup, parse_mode=ParseMode.HTML
+            )
+        except BadRequest:
+            await update.callback_query.answer()
+    else:
+        await update.effective_message.reply_text(
+            text, reply_markup=markup, parse_mode=ParseMode.HTML
+        )
+
+
+async def course_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    course_id = int(query.data.split("_")[1])
+    await show_course_videos_page(update, context, course_id=course_id, page=0, edit=True)
+
+
+async def course_videos_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split("_")
+    course_id = int(parts[1])
+    page = int(parts[-1])
+    await show_course_videos_page(update, context, course_id=course_id, page=page, edit=True)
 
 
 async def video_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     video_id = int(query.data.split("_")[1])
     video = get_video_by_id(video_id)
     if not video:
         await query.edit_message_text("ویدیو پیدا نشد.")
         return
 
-    _, title, episode, url, course_name = video
-
-    text = f"🎬 **{title}**\n\n"
-    text += f"📘 درس: {course_name}\n"
+    _, title, episode, url, course_name, course_id = video
+    text = f"🎬 <b>{safe_text(title)}</b>\n\n"
+    text += f"📘 درس: {safe_text(course_name)}\n"
     if episode:
-        text += f"📌 قسمت: {episode}\n"
-    text += f"\n🔗 لینک نماشا:\n{url}"
+        text += f"📌 قسمت: {safe_text(str(episode))}\n"
+    text += f"\n🔗 لینک نماشا:\n{safe_text(url)}"
 
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("▶️ مشاهده در نماشا", url=url)],
-            [InlineKeyboardButton("🔙 بازگشت", callback_data=f"course_{get_course_id_from_video(video_id)}")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data=f"course_{course_id}")],
         ]
     )
-
-    await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
-
-
-def get_course_id_from_video(video_id: int) -> int:
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("SELECT course_id FROM videos WHERE id = ?", (video_id,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else 0
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    except BadRequest:
+        await query.edit_message_text(
+            f"🎬 {title}\n\n📘 {course_name}\n🔗 {url}",
+            reply_markup=keyboard,
+        )
 
 
 async def back_to_courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    courses = get_all_courses()
-    if not courses:
-        await query.edit_message_text("هیچ درسی وجود ندارد.")
-        return
-
-    buttons = []
-    for course_id, name, teacher in courses:
-        label = f"📘 {name}"
-        if teacher:
-            label += f" ({teacher})"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"course_{course_id}")])
-
-    await query.edit_message_text(
-        "📚 **لیست دروس**\nیکی را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode="Markdown",
-    )
+    await show_courses_page(update, context, page=0, edit=True)
 
 
 async def search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -389,10 +545,8 @@ async def search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("waiting_search"):
         return
-
     query = update.message.text.strip()
     context.user_data["waiting_search"] = False
-
     if len(query) < 2:
         await update.message.reply_text(
             "عبارت خیلی کوتاه است.",
@@ -401,7 +555,6 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     results = search_videos(query)
-
     if not results:
         await update.message.reply_text(
             f"نتیجه‌ای برای «{query}» پیدا نشد.",
@@ -409,17 +562,17 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    text = f"🔎 نتایج جستجو برای «{query}»:\n\n"
+    text = f"🔎 نتایج جستجو برای «{safe_text(query)}»:\n\n"
     buttons = []
     for vid_id, title, episode, url, course_name in results[:20]:
-        label = f"{course_name} — {title}"
         if episode:
             label = f"{course_name} | قسمت {episode}"
+        else:
+            label = f"{course_name} — {title}"
         buttons.append([InlineKeyboardButton(label[:60], callback_data=f"video_{vid_id}")])
 
     await update.message.reply_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(buttons),
+        text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML
     )
     await update.message.reply_text(
         "از منوی زیر ادامه دهید:",
@@ -441,179 +594,48 @@ async def latest_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     rows = c.fetchall()
     conn.close()
-
     if not rows:
         await update.message.reply_text("هنوز ویدیویی ثبت نشده است.")
         return
 
     buttons = []
     for vid_id, title, episode, course_name in rows:
-        label = f"{course_name} — {title}"
         if episode:
             label = f"{course_name} | قسمت {episode}"
+        else:
+            label = f"{course_name} — {title}"
         buttons.append([InlineKeyboardButton(label[:60], callback_data=f"video_{vid_id}")])
 
     await update.message.reply_text(
-        "🆕 **آخرین ویدیوهای اضافه‌شده:**",
+        "🆕 <b>آخرین ویدیوهای اضافه‌شده:</b>",
         reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode="Markdown",
+        parse_mode=ParseMode.HTML,
     )
 
 
-# ==================== پنل مدیریت ====================
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("شما دسترسی ادمین ندارید.")
         return
-
     courses, videos = count_stats()
     text = (
-        "⚙️ **پنل مدیریت**\n\n"
+        "⚙️ <b>پنل مدیریت</b>\n\n"
         f"تعداد دروس: {courses}\n"
         f"تعداد ویدیوها: {videos}\n\n"
         "یکی از گزینه‌ها را انتخاب کنید:"
     )
-    await update.message.reply_text(text, reply_markup=admin_keyboard(), parse_mode="Markdown")
-
-
-async def admin_add_course_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        "نام درس را وارد کنید (مثال: نظریه آمار ۱):",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return ADD_COURSE_NAME
-
-
-async def admin_add_course_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
-    if len(name) < 2:
-        await update.message.reply_text("نام درس خیلی کوتاه است. دوباره وارد کنید:")
-        return ADD_COURSE_NAME
-
-    success = add_course(name)
-    if success:
-        await update.message.reply_text(
-            f"✅ درس «{name}» با موفقیت اضافه شد.",
-            reply_markup=admin_keyboard(),
-        )
-    else:
-        await update.message.reply_text(
-            f"⚠️ این درس از قبل وجود دارد.",
-            reply_markup=admin_keyboard(),
-        )
-    return ConversationHandler.END
-
-
-async def admin_add_video_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return ConversationHandler.END
-
-    courses = get_all_courses()
-    if not courses:
-        await update.message.reply_text(
-            "ابتدا باید حداقل یک درس اضافه کنید.",
-            reply_markup=admin_keyboard(),
-        )
-        return ConversationHandler.END
-
-    buttons = []
-    for course_id, name, _ in courses:
-        buttons.append([InlineKeyboardButton(name, callback_data=f"addvid_course_{course_id}")])
-
-    await update.message.reply_text(
-        "درس مربوط به ویدیو را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-    return ADD_VIDEO_COURSE
-
-
-async def admin_add_video_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    course_id = int(query.data.split("_")[2])
-    context.user_data["add_video_course_id"] = course_id
-
-    course = get_course_by_id(course_id)
-    await query.edit_message_text(
-        f"درس انتخاب‌شده: **{course[1]}**\n\nحالا عنوان ویدیو را بفرستید (مثال: قسمت ۲ یا نظریه آمار ۱ - قسمت ۲):",
-        parse_mode="Markdown",
-    )
-    return ADD_VIDEO_TITLE
-
-
-async def admin_add_video_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    title = update.message.text.strip()
-    context.user_data["add_video_title"] = title
-
-    # تلاش برای استخراج شماره قسمت
-    episode_match = re.search(r"قسمت\s*(\d+)", title)
-    episode = episode_match.group(1) if episode_match else None
-    context.user_data["add_video_episode"] = episode
-
-    await update.message.reply_text(
-        "حالا لینک نماشا را بفرستید (مثال:\nhttps://www.namasha.com/v/xxxxxx )"
-    )
-    return ADD_VIDEO_URL
-
-
-async def admin_add_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-
-    if "namasha.com" not in url:
-        await update.message.reply_text(
-            "لینک معتبر نیست. لینک باید از سایت namasha.com باشد. دوباره بفرستید:"
-        )
-        return ADD_VIDEO_URL
-
-    course_id = context.user_data.get("add_video_course_id")
-    title = context.user_data.get("add_video_title")
-    episode = context.user_data.get("add_video_episode")
-
-    success = add_video(course_id, title, url, episode)
-
-    if success:
-        await update.message.reply_text(
-            f"✅ ویدیو با موفقیت اضافه شد.\n\nعنوان: {title}\nلینک: {url}",
-            reply_markup=admin_keyboard(),
-        )
-    else:
-        await update.message.reply_text(
-            "⚠️ این لینک قبلاً ثبت شده است.",
-            reply_markup=admin_keyboard(),
-        )
-
-    # پاک کردن داده‌های موقت
-    context.user_data.pop("add_video_course_id", None)
-    context.user_data.pop("add_video_title", None)
-    context.user_data.pop("add_video_episode", None)
-
-    return ConversationHandler.END
+    await update.message.reply_text(text, reply_markup=admin_keyboard(), parse_mode=ParseMode.HTML)
 
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-
     courses, videos = count_stats()
     await update.message.reply_text(
-        f"📊 **آمار آرشیو**\n\n"
-        f"تعداد دروس: {courses}\n"
-        f"تعداد ویدیوها: {videos}",
-        parse_mode="Markdown",
+        f"📊 <b>آمار آرشیو</b>\n\nتعداد دروس: {courses}\nتعداد ویدیوها: {videos}",
+        parse_mode=ParseMode.HTML,
         reply_markup=admin_keyboard(),
     )
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "عملیات لغو شد.",
-        reply_markup=main_keyboard(is_admin(update.effective_user.id)),
-    )
-    return ConversationHandler.END
 
 
 async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -623,15 +645,347 @@ async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "عملیات لغو شد.",
+        reply_markup=main_keyboard(is_admin(update.effective_user.id)),
+    )
+    return ConversationHandler.END
+
+
+async def admin_add_course_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "نام درس را وارد کنید (مثال: نظریه آمار ۱ دکتر روحانی):\n\n/cancel برای لغو",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ADD_COURSE_NAME
+
+
+async def admin_add_course_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = normalize_digits(update.message.text.strip())
+    if len(name) < 2:
+        await update.message.reply_text("نام درس خیلی کوتاه است. دوباره وارد کنید:")
+        return ADD_COURSE_NAME
+    success = add_course(name)
+    if success:
+        await update.message.reply_text(
+            f"✅ درس «{name}» با موفقیت اضافه شد.",
+            reply_markup=admin_keyboard(),
+        )
+    else:
+        await update.message.reply_text(
+            "⚠️ این درس از قبل وجود دارد.",
+            reply_markup=admin_keyboard(),
+        )
+    return ConversationHandler.END
+
+
+async def admin_add_video_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    courses = get_all_courses()
+    if not courses:
+        await update.message.reply_text(
+            "ابتدا باید حداقل یک درس اضافه کنید.",
+            reply_markup=admin_keyboard(),
+        )
+        return ConversationHandler.END
+    buttons = [
+        [InlineKeyboardButton(name, callback_data=f"addvid_course_{cid}")]
+        for cid, name, _ in courses
+    ]
+    await update.message.reply_text(
+        "درس مربوط به ویدیو را انتخاب کنید:\n\n/cancel برای لغو",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return ADD_VIDEO_COURSE
+
+
+async def admin_add_video_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    course_id = int(query.data.split("_")[2])
+    context.user_data["add_video_course_id"] = course_id
+    course = get_course_by_id(course_id)
+    await query.edit_message_text(
+        f"درس انتخاب‌شده: <b>{safe_text(course[1])}</b>\n\n"
+        "عنوان ویدیو را بفرستید (مثال: قسمت ۲):",
+        parse_mode=ParseMode.HTML,
+    )
+    return ADD_VIDEO_TITLE
+
+
+async def admin_add_video_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    title = normalize_digits(update.message.text.strip())
+    context.user_data["add_video_title"] = title
+    context.user_data["add_video_episode"] = extract_episode(title)
+    await update.message.reply_text(
+        "حالا لینک نماشا را بفرستید:\nhttps://www.namasha.com/v/xxxxxx"
+    )
+    return ADD_VIDEO_URL
+
+
+async def admin_add_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    if "namasha.com" not in url:
+        await update.message.reply_text(
+            "لینک معتبر نیست. لینک باید از namasha.com باشد. دوباره بفرستید:"
+        )
+        return ADD_VIDEO_URL
+
+    course_id = context.user_data.get("add_video_course_id")
+    title = context.user_data.get("add_video_title")
+    episode = context.user_data.get("add_video_episode")
+    success = add_video(course_id, title, url, episode)
+    if success:
+        ep_info = f"\nقسمت: {episode}" if episode else ""
+        await update.message.reply_text(
+            f"✅ ویدیو اضافه شد.\n\nعنوان: {title}{ep_info}\nلینک: {url}",
+            reply_markup=admin_keyboard(),
+        )
+    else:
+        await update.message.reply_text(
+            "⚠️ این لینک قبلاً ثبت شده است.",
+            reply_markup=admin_keyboard(),
+        )
+    for k in ("add_video_course_id", "add_video_title", "add_video_episode"):
+        context.user_data.pop(k, None)
+    return ConversationHandler.END
+
+
+async def admin_delete_video_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    courses = get_all_courses()
+    if not courses:
+        await update.message.reply_text("درسی وجود ندارد.", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+    buttons = [
+        [InlineKeyboardButton(name, callback_data=f"delvid_course_{cid}")]
+        for cid, name, _ in courses
+    ]
+    await update.message.reply_text(
+        "درس مورد نظر برای حذف ویدیو را انتخاب کنید:\n\n/cancel برای لغو",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return DELETE_VIDEO_SELECT
+
+
+async def admin_delete_video_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data.startswith("delvid_course_"):
+        course_id = int(query.data.split("_")[2])
+        videos = get_videos_by_course(course_id)
+        if not videos:
+            await query.edit_message_text("این درس ویدیویی ندارد.")
+            return ConversationHandler.END
+        buttons = []
+        for vid_id, title, episode, _ in videos:
+            label = f"قسمت {episode} — {title}" if episode else title
+            buttons.append(
+                [InlineKeyboardButton(f"🗑 {label[:50]}", callback_data=f"delvid_id_{vid_id}")]
+            )
+        await query.edit_message_text(
+            "ویدیوی مورد نظر برای حذف را انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return DELETE_VIDEO_SELECT
+
+    if query.data.startswith("delvid_id_"):
+        video_id = int(query.data.split("_")[2])
+        video = get_video_by_id(video_id)
+        if not video:
+            await query.edit_message_text("ویدیو پیدا نشد.")
+            return ConversationHandler.END
+        context.user_data["delete_video_id"] = video_id
+        _, title, episode, url, course_name, _ = video
+        text = (
+            f"آیا از حذف این ویدیو مطمئن هستید؟\n\n"
+            f"📘 {safe_text(course_name)}\n"
+            f"🎬 {safe_text(title)}\n"
+        )
+        if episode:
+            text += f"📌 قسمت: {episode}\n"
+        buttons = [
+            [
+                InlineKeyboardButton("✅ بله، حذف شود", callback_data="delvid_confirm_yes"),
+                InlineKeyboardButton("❌ انصراف", callback_data="delvid_confirm_no"),
+            ]
+        ]
+        await query.edit_message_text(
+            text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML
+        )
+        return DELETE_VIDEO_CONFIRM
+
+    return DELETE_VIDEO_SELECT
+
+
+async def admin_delete_video_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "delvid_confirm_no":
+        await query.edit_message_text("حذف لغو شد.")
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="پنل مدیریت:",
+            reply_markup=admin_keyboard(),
+        )
+        context.user_data.pop("delete_video_id", None)
+        return ConversationHandler.END
+
+    video_id = context.user_data.get("delete_video_id")
+    if video_id and delete_video(video_id):
+        await query.edit_message_text("✅ ویدیو حذف شد.")
+    else:
+        await query.edit_message_text("⚠️ حذف انجام نشد.")
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text="پنل مدیریت:",
+        reply_markup=admin_keyboard(),
+    )
+    context.user_data.pop("delete_video_id", None)
+    return ConversationHandler.END
+
+
+async def admin_edit_video_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    courses = get_all_courses()
+    if not courses:
+        await update.message.reply_text("درسی وجود ندارد.", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+    buttons = [
+        [InlineKeyboardButton(name, callback_data=f"editvid_course_{cid}")]
+        for cid, name, _ in courses
+    ]
+    await update.message.reply_text(
+        "درس مربوط به ویدیو را انتخاب کنید:\n\n/cancel برای لغو",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return EDIT_VIDEO_SELECT
+
+
+async def admin_edit_video_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data.startswith("editvid_course_"):
+        course_id = int(query.data.split("_")[2])
+        videos = get_videos_by_course(course_id)
+        if not videos:
+            await query.edit_message_text("این درس ویدیویی ندارد.")
+            return ConversationHandler.END
+        buttons = []
+        for vid_id, title, episode, _ in videos:
+            label = f"قسمت {episode} — {title}" if episode else title
+            buttons.append(
+                [InlineKeyboardButton(f"✏️ {label[:50]}", callback_data=f"editvid_id_{vid_id}")]
+            )
+        await query.edit_message_text(
+            "ویدیوی مورد نظر را انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return EDIT_VIDEO_SELECT
+
+    if query.data.startswith("editvid_id_"):
+        video_id = int(query.data.split("_")[2])
+        video = get_video_by_id(video_id)
+        if not video:
+            await query.edit_message_text("ویدیو پیدا نشد.")
+            return ConversationHandler.END
+        context.user_data["edit_video_id"] = video_id
+        _, title, episode, url, course_name, _ = video
+        text = (
+            f"ویرایش ویدیو:\n\n"
+            f"📘 {safe_text(course_name)}\n"
+            f"🎬 عنوان: {safe_text(title)}\n"
+            f"📌 قسمت: {safe_text(str(episode or '-'))}\n"
+            f"🔗 {safe_text(url)}\n\n"
+            "کدام مورد را می‌خواهید ویرایش کنید؟"
+        )
+        buttons = [
+            [InlineKeyboardButton("📝 عنوان", callback_data="editvid_field_title")],
+            [InlineKeyboardButton("📌 شماره قسمت", callback_data="editvid_field_episode")],
+            [InlineKeyboardButton("🔗 لینک", callback_data="editvid_field_url")],
+            [InlineKeyboardButton("❌ انصراف", callback_data="editvid_field_cancel")],
+        ]
+        await query.edit_message_text(
+            text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML
+        )
+        return EDIT_VIDEO_FIELD
+
+    return EDIT_VIDEO_SELECT
+
+
+async def admin_edit_video_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "editvid_field_cancel":
+        await query.edit_message_text("ویرایش لغو شد.")
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="پنل مدیریت:",
+            reply_markup=admin_keyboard(),
+        )
+        context.user_data.pop("edit_video_id", None)
+        return ConversationHandler.END
+
+    field = query.data.replace("editvid_field_", "")
+    context.user_data["edit_video_field"] = field
+    prompts = {
+        "title": "عنوان جدید را بفرستید:",
+        "episode": "شماره قسمت جدید را بفرستید (مثال: 12 یا 12-1):",
+        "url": "لینک جدید نماشا را بفرستید:",
+    }
+    await query.edit_message_text(prompts.get(field, "مقدار جدید را بفرستید:"))
+    return EDIT_VIDEO_VALUE
+
+
+async def admin_edit_video_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    video_id = context.user_data.get("edit_video_id")
+    field = context.user_data.get("edit_video_field")
+    value = normalize_digits(update.message.text.strip())
+    if not video_id or not field:
+        await update.message.reply_text("خطا در ویرایش.", reply_markup=admin_keyboard())
+        return ConversationHandler.END
+    if field == "url" and "namasha.com" not in value:
+        await update.message.reply_text("لینک معتبر نیست. دوباره بفرستید:")
+        return EDIT_VIDEO_VALUE
+
+    kwargs = {}
+    if field == "title":
+        kwargs["title"] = value
+    elif field == "episode":
+        kwargs["episode"] = value
+    elif field == "url":
+        kwargs["namasha_url"] = value
+
+    ok = update_video(video_id, **kwargs)
+    if ok:
+        await update.message.reply_text(
+            "✅ ویدیو با موفقیت ویرایش شد.", reply_markup=admin_keyboard()
+        )
+    else:
+        await update.message.reply_text(
+            "⚠️ ویرایش انجام نشد (شاید لینک تکراری باشد).",
+            reply_markup=admin_keyboard(),
+        )
+    context.user_data.pop("edit_video_id", None)
+    context.user_data.pop("edit_video_field", None)
+    return ConversationHandler.END
+
+
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """مسیریابی پیام‌های متنی منو"""
     text = update.message.text
     user_id = update.effective_user.id
-
     if context.user_data.get("waiting_search"):
         await handle_search(update, context)
         return
-
     if text == "📚 لیست دروس":
         await show_courses(update, context)
     elif text == "🔍 جستجو":
@@ -646,11 +1000,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await admin_stats(update, context)
     elif text == "🔙 بازگشت به منوی اصلی":
         await back_to_main(update, context)
-    elif text == "➕ افزودن درس":
-        # این توسط ConversationHandler مدیریت می‌شود
-        pass
-    elif text == "🎬 افزودن ویدیو":
-        pass
     else:
         await update.message.reply_text(
             "دستور نامعتبر است. از منو استفاده کنید.",
@@ -658,20 +1007,16 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ==================== اجرای ربات ====================
 def main():
     if not BOT_TOKEN:
         print("❌ خطا: BOT_TOKEN تنظیم نشده است.")
-        print("فایل .env را بسازید و توکن را داخل آن قرار دهید.")
         return
-
     if not ADMIN_IDS:
-        print("⚠️ هشدار: هیچ ادمینی تعریف نشده است. ADMIN_IDS را در فایل .env تنظیم کنید.")
+        print("⚠️ هشدار: هیچ ادمینی تعریف نشده است.")
 
     init_db()
     print("✅ دیتابیس آماده است.")
 
-    # افزایش تایم‌اوت برای اتصال‌های ضعیف (مخصوصاً ایران)
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -685,16 +1030,14 @@ def main():
         .build()
     )
 
-    # ConversationHandler برای افزودن درس
     add_course_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^➕ افزودن درس$"), admin_add_course_start)],
         states={
             ADD_COURSE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_course_name)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
-
-    # ConversationHandler برای افزودن ویدیو
     add_video_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🎬 افزودن ویدیو$"), admin_add_video_start)],
         states={
@@ -703,20 +1046,51 @@ def main():
             ADD_VIDEO_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_video_url)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+    delete_video_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🗑 حذف ویدیو$"), admin_delete_video_start)],
+        states={
+            DELETE_VIDEO_SELECT: [CallbackQueryHandler(admin_delete_video_course, pattern=r"^delvid_")],
+            DELETE_VIDEO_CONFIRM: [
+                CallbackQueryHandler(admin_delete_video_confirm, pattern=r"^delvid_confirm_")
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+    edit_video_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^✏️ ویرایش ویدیو$"), admin_edit_video_start)],
+        states={
+            EDIT_VIDEO_SELECT: [CallbackQueryHandler(admin_edit_video_select, pattern=r"^editvid_")],
+            EDIT_VIDEO_FIELD: [
+                CallbackQueryHandler(admin_edit_video_field, pattern=r"^editvid_field_")
+            ],
+            EDIT_VIDEO_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_video_value)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(add_course_conv)
     app.add_handler(add_video_conv)
-    app.add_handler(CallbackQueryHandler(course_selected, pattern=r"^course_"))
-    app.add_handler(CallbackQueryHandler(video_selected, pattern=r"^video_"))
+    app.add_handler(delete_video_conv)
+    app.add_handler(edit_video_conv)
+    app.add_handler(CallbackQueryHandler(course_selected, pattern=r"^course_\d+$"))
+    app.add_handler(CallbackQueryHandler(courses_page_callback, pattern=r"^courses_page_\d+$"))
+    app.add_handler(CallbackQueryHandler(course_videos_page_callback, pattern=r"^cv_\d+_page_\d+$"))
+    app.add_handler(CallbackQueryHandler(video_selected, pattern=r"^video_\d+$"))
     app.add_handler(CallbackQueryHandler(back_to_courses, pattern=r"^back_courses$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    app.add_error_handler(error_handler)
 
     print("🤖 ربات در حال اجرا است...")
-    print("اگر خطا گرفتی، حتماً VPN را روشن کن و دوباره امتحان کن.")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
