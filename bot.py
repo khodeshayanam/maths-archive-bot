@@ -1,10 +1,12 @@
 import os
 import re
-import sqlite3
 import logging
 from datetime import datetime
 from typing import Optional, List, Tuple
+from contextlib import contextmanager
 
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -36,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 PAGE_SIZE = 10
 
@@ -55,7 +58,6 @@ PAGE_SIZE = 10
     DELETE_COURSE_CONFIRM,
 ) = range(13)
 
-DB_PATH = "database.db"
 PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 
 
@@ -99,232 +101,226 @@ def episode_sort_key(episode: Optional[str]) -> Tuple[int, int, str]:
         return (10**9, 0, ep)
 
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS courses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            teacher TEXT,
-            created_at TEXT
-        )
-        """
-    )
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS videos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            course_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            episode TEXT,
-            namasha_url TEXT NOT NULL UNIQUE,
-            created_at TEXT,
-            FOREIGN KEY (course_id) REFERENCES courses (id)
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
-
-
+@contextmanager
 def get_connection():
-    return sqlite3.connect(DB_PATH)
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL تنظیم نشده است.")
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db():
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS courses (
+                id SERIAL PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                teacher TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS videos (
+                id SERIAL PRIMARY KEY,
+                course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                episode TEXT,
+                namasha_url TEXT NOT NULL UNIQUE,
+                created_at TEXT
+            )
+            """
+        )
 
 
 def add_course(name: str, teacher: str = None) -> bool:
     try:
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO courses (name, teacher, created_at) VALUES (?, ?, ?)",
-            (name.strip(), teacher, datetime.now().isoformat()),
-        )
-        conn.commit()
-        conn.close()
+        with get_connection() as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO courses (name, teacher, created_at) VALUES (%s, %s, %s)",
+                (name.strip(), teacher, datetime.now().isoformat()),
+            )
         return True
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         return False
 
 
 def update_course(course_id: int, name: str) -> bool:
     try:
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute(
-            "UPDATE courses SET name = ? WHERE id = ?",
-            (normalize_digits(name.strip()), course_id),
-        )
-        conn.commit()
-        ok = c.rowcount > 0
-        conn.close()
-        return ok
-    except sqlite3.IntegrityError:
+        with get_connection() as conn:
+            c = conn.cursor()
+            c.execute(
+                "UPDATE courses SET name = %s WHERE id = %s",
+                (normalize_digits(name.strip()), course_id),
+            )
+            return c.rowcount > 0
+    except psycopg2.IntegrityError:
         return False
 
 
 def delete_course(course_id: int) -> bool:
-    """حذف درس به همراه تمام ویدیوهایش"""
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("DELETE FROM videos WHERE course_id = ?", (course_id,))
-    c.execute("DELETE FROM courses WHERE id = ?", (course_id,))
-    conn.commit()
-    ok = c.rowcount > 0
-    conn.close()
-    return ok
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM videos WHERE course_id = %s", (course_id,))
+        c.execute("DELETE FROM courses WHERE id = %s", (course_id,))
+        return c.rowcount > 0
 
 
 def count_videos_in_course(course_id: int) -> int:
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM videos WHERE course_id = ?", (course_id,))
-    n = c.fetchone()[0]
-    conn.close()
-    return n
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM videos WHERE course_id = %s", (course_id,))
+        return c.fetchone()[0]
 
 
 def get_all_courses() -> List[Tuple]:
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("SELECT id, name, teacher FROM courses ORDER BY name")
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, name, teacher FROM courses ORDER BY name")
+        return c.fetchall()
 
 
 def get_course_by_id(course_id: int):
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("SELECT id, name, teacher FROM courses WHERE id = ?", (course_id,))
-    row = c.fetchone()
-    conn.close()
-    return row
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, name, teacher FROM courses WHERE id = %s", (course_id,))
+        return c.fetchone()
 
 
 def add_video(course_id: int, title: str, namasha_url: str, episode: str = None) -> bool:
     try:
         title = normalize_digits(title.strip())
         episode = normalize_digits(episode) if episode else extract_episode(title)
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute(
-            """
-            INSERT INTO videos (course_id, title, episode, namasha_url, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (course_id, title, episode, namasha_url.strip(), datetime.now().isoformat()),
-        )
-        conn.commit()
-        conn.close()
+        with get_connection() as conn:
+            c = conn.cursor()
+            c.execute(
+                """
+                INSERT INTO videos (course_id, title, episode, namasha_url, created_at)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (course_id, title, episode, namasha_url.strip(), datetime.now().isoformat()),
+            )
         return True
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         return False
 
 
 def update_video(video_id: int, title: str = None, episode: str = None, namasha_url: str = None) -> bool:
-    conn = get_connection()
-    c = conn.cursor()
     fields = []
     values = []
     if title is not None:
         title = normalize_digits(title.strip())
-        fields.append("title = ?")
+        fields.append("title = %s")
         values.append(title)
         if episode is None:
             episode = extract_episode(title)
     if episode is not None:
-        fields.append("episode = ?")
+        fields.append("episode = %s")
         values.append(normalize_digits(str(episode)))
     if namasha_url is not None:
-        fields.append("namasha_url = ?")
+        fields.append("namasha_url = %s")
         values.append(namasha_url.strip())
     if not fields:
-        conn.close()
         return False
     values.append(video_id)
     try:
-        c.execute(f"UPDATE videos SET {', '.join(fields)} WHERE id = ?", values)
-        conn.commit()
-        ok = c.rowcount > 0
-        conn.close()
-        return ok
-    except sqlite3.IntegrityError:
-        conn.close()
+        with get_connection() as conn:
+            c = conn.cursor()
+            c.execute(f"UPDATE videos SET {', '.join(fields)} WHERE id = %s", values)
+            return c.rowcount > 0
+    except psycopg2.IntegrityError:
         return False
 
 
 def get_videos_by_course(course_id: int) -> List[Tuple]:
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute(
-        "SELECT id, title, episode, namasha_url FROM videos WHERE course_id = ?",
-        (course_id,),
-    )
-    rows = c.fetchall()
-    conn.close()
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT id, title, episode, namasha_url FROM videos WHERE course_id = %s",
+            (course_id,),
+        )
+        rows = c.fetchall()
     return sorted(rows, key=lambda r: episode_sort_key(r[2]))
 
 
 def search_videos(query: str) -> List[Tuple]:
-    conn = get_connection()
-    c = conn.cursor()
     q = normalize_digits(query.strip())
     like = f"%{q}%"
-    c.execute(
-        """
-        SELECT v.id, v.title, v.episode, v.namasha_url, c.name
-        FROM videos v
-        JOIN courses c ON v.course_id = c.id
-        WHERE v.title LIKE ? OR c.name LIKE ?
-           OR IFNULL(v.episode,'') LIKE ? OR IFNULL(c.teacher,'') LIKE ?
-        ORDER BY c.name
-        LIMIT 50
-        """,
-        (like, like, like, like),
-    )
-    rows = c.fetchall()
-    conn.close()
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT v.id, v.title, v.episode, v.namasha_url, c.name
+            FROM videos v
+            JOIN courses c ON v.course_id = c.id
+            WHERE v.title ILIKE %s OR c.name ILIKE %s
+               OR COALESCE(v.episode,'') ILIKE %s OR COALESCE(c.teacher,'') ILIKE %s
+            ORDER BY c.name
+            LIMIT 50
+            """,
+            (like, like, like, like),
+        )
+        rows = c.fetchall()
     return sorted(rows, key=lambda r: (r[4], episode_sort_key(r[2])))
 
 
 def get_video_by_id(video_id: int):
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute(
-        """
-        SELECT v.id, v.title, v.episode, v.namasha_url, c.name, v.course_id
-        FROM videos v
-        JOIN courses c ON v.course_id = c.id
-        WHERE v.id = ?
-        """,
-        (video_id,),
-    )
-    row = c.fetchone()
-    conn.close()
-    return row
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT v.id, v.title, v.episode, v.namasha_url, c.name, v.course_id
+            FROM videos v
+            JOIN courses c ON v.course_id = c.id
+            WHERE v.id = %s
+            """,
+            (video_id,),
+        )
+        return c.fetchone()
 
 
 def delete_video(video_id: int) -> bool:
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("DELETE FROM videos WHERE id = ?", (video_id,))
-    conn.commit()
-    ok = c.rowcount > 0
-    conn.close()
-    return ok
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM videos WHERE id = %s", (video_id,))
+        return c.rowcount > 0
 
 
 def count_stats():
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM courses")
-    courses = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM videos")
-    videos = c.fetchone()[0]
-    conn.close()
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM courses")
+        courses = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM videos")
+        videos = c.fetchone()[0]
     return courses, videos
+
+
+def get_latest_videos(limit: int = 15):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT v.id, v.title, v.episode, c.name
+            FROM videos v
+            JOIN courses c ON v.course_id = c.id
+            ORDER BY v.id DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        return c.fetchall()
 
 
 def is_admin(user_id: int) -> bool:
@@ -592,10 +588,16 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("waiting_search"):
         return
     query = update.message.text.strip()
-    # اگر کاربر منوی اصلی زد، جستجو را لغو کن
-    if query in ("🏠 منوی اصلی", "📚 لیست دروس", "🔍 جستجو", "🆕 آخرین ویدیوها", "📖 راهنما", "⚙️ پنل مدیریت"):
+    if query in (
+        "🏠 منوی اصلی",
+        "📚 لیست دروس",
+        "🔍 جستجو",
+        "🆕 آخرین ویدیوها",
+        "📖 راهنما",
+        "⚙️ پنل مدیریت",
+    ):
         context.user_data["waiting_search"] = False
-        return False  # اجازه بده text_router ادامه دهد
+        return False
 
     context.user_data["waiting_search"] = False
     if len(query) < 2:
@@ -633,19 +635,7 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def latest_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute(
-        """
-        SELECT v.id, v.title, v.episode, c.name
-        FROM videos v
-        JOIN courses c ON v.course_id = c.id
-        ORDER BY v.id DESC
-        LIMIT 15
-        """
-    )
-    rows = c.fetchall()
-    conn.close()
+    rows = get_latest_videos(15)
     if not rows:
         await update.message.reply_text("هنوز ویدیویی ثبت نشده است.")
         return
@@ -707,7 +697,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ----- افزودن درس -----
 async def admin_add_course_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
@@ -737,7 +726,6 @@ async def admin_add_course_name(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
-# ----- ویرایش درس -----
 async def admin_edit_course_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
@@ -793,7 +781,6 @@ async def admin_edit_course_name(update: Update, context: ContextTypes.DEFAULT_T
     return ConversationHandler.END
 
 
-# ----- حذف درس -----
 async def admin_delete_course_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
@@ -867,7 +854,6 @@ async def admin_delete_course_confirm(update: Update, context: ContextTypes.DEFA
     return ConversationHandler.END
 
 
-# ----- افزودن ویدیو -----
 async def admin_add_video_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
@@ -941,7 +927,6 @@ async def admin_add_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-# ----- حذف ویدیو -----
 async def admin_delete_video_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
@@ -1038,7 +1023,6 @@ async def admin_delete_video_confirm(update: Update, context: ContextTypes.DEFAU
     return ConversationHandler.END
 
 
-# ----- ویرایش ویدیو -----
 async def admin_edit_video_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
@@ -1175,7 +1159,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         handled = await handle_search(update, context)
         if handled:
             return
-        # اگر False بود یعنی کاربر دکمه منو زده؛ ادامه بده
 
     if text in ("🏠 منوی اصلی", "🔙 بازگشت به منوی اصلی"):
         await back_to_main(update, context)
@@ -1202,11 +1185,14 @@ def main():
     if not BOT_TOKEN:
         print("❌ خطا: BOT_TOKEN تنظیم نشده است.")
         return
+    if not DATABASE_URL:
+        print("❌ خطا: DATABASE_URL تنظیم نشده است.")
+        return
     if not ADMIN_IDS:
         print("⚠️ هشدار: هیچ ادمینی تعریف نشده است.")
 
     init_db()
-    print("✅ دیتابیس آماده است.")
+    print("✅ دیتابیس PostgreSQL آماده است.")
 
     app = (
         Application.builder()
@@ -1309,7 +1295,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_error_handler(error_handler)
 
-    print("🤖 ربات در حال اجرا است...")
+    print("🤖 ربات با PostgreSQL در حال اجرا است...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
