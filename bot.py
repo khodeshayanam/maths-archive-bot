@@ -72,7 +72,14 @@ def safe_text(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def is_valid_namasha_url(url: str) -> bool:
+    if not url:
+        return False
+    return bool(re.match(r"^https?://(www\.)?namasha\.com/", url.strip(), re.IGNORECASE))
+
+
 def extract_episode(title: str) -> Optional[str]:
+    """فقط وقتی کلمات قسمت/جلسه/episode باشد شماره استخراج می‌شود."""
     title = normalize_digits(title)
     match = re.search(
         r"(?:قسمت|جلسه|part|episode)\s*([0-9]+(?:[.-][0-9]+)?)",
@@ -81,9 +88,6 @@ def extract_episode(title: str) -> Optional[str]:
     )
     if match:
         return match.group(1)
-    match2 = re.search(r"\b([0-9]+)\s*$", title.strip())
-    if match2:
-        return match2.group(1)
     return None
 
 
@@ -700,7 +704,8 @@ async def admin_add_course_start(update: Update, context: ContextTypes.DEFAULT_T
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     await update.message.reply_text(
-        "نام درس را وارد کنید (مثال: نظریه آمار ۱ دکتر روحانی):\n\n/cancel برای لغو",
+        "نام درس را وارد کنید (مثال: نظریه آمار ۱ دکتر روحانی):\n\n"
+        "برای لغو: /cancel یا «🏠 منوی اصلی»",
         reply_markup=ReplyKeyboardRemove(),
     )
     return ADD_COURSE_NAME
@@ -708,6 +713,8 @@ async def admin_add_course_start(update: Update, context: ContextTypes.DEFAULT_T
 
 async def admin_add_course_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = normalize_digits(update.message.text.strip())
+    if name in ("🏠 منوی اصلی", "/cancel"):
+        return await cancel(update, context)
     if len(name) < 2:
         await update.message.reply_text("نام درس خیلی کوتاه است. دوباره وارد کنید:")
         return ADD_COURSE_NAME
@@ -737,7 +744,12 @@ async def admin_edit_course_start(update: Update, context: ContextTypes.DEFAULT_
         for cid, name, _ in courses
     ]
     await update.message.reply_text(
-        "درسی که می‌خواهید ویرایش کنید را انتخاب کنید:\n\n/cancel برای لغو",
+        "درسی که می‌خواهید ویرایش کنید را انتخاب کنید:\n\n"
+        "برای لغو: /cancel یا «🏠 منوی اصلی»",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await update.message.reply_text(
+        "یکی از دروس زیر را انتخاب کنید:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     return EDIT_COURSE_SELECT
@@ -762,6 +774,8 @@ async def admin_edit_course_select(update: Update, context: ContextTypes.DEFAULT
 async def admin_edit_course_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     course_id = context.user_data.get("edit_course_id")
     name = normalize_digits(update.message.text.strip())
+    if name in ("🏠 منوی اصلی", "/cancel"):
+        return await cancel(update, context)
     if not course_id or len(name) < 2:
         await update.message.reply_text("نام نامعتبر است.", reply_markup=admin_keyboard())
         return ConversationHandler.END
@@ -793,7 +807,12 @@ async def admin_delete_course_start(update: Update, context: ContextTypes.DEFAUL
     ]
     await update.message.reply_text(
         "درسی که می‌خواهید حذف کنید را انتخاب کنید:\n"
-        "⚠️ با حذف درس، همه ویدیوهای آن هم پاک می‌شوند.\n\n/cancel برای لغو",
+        "⚠️ با حذف درس، همه ویدیوهای آن هم پاک می‌شوند.\n\n"
+        "برای لغو: /cancel یا «🏠 منوی اصلی»",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await update.message.reply_text(
+        "یکی از دروس زیر را انتخاب کنید:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     return DELETE_COURSE_SELECT
@@ -868,7 +887,12 @@ async def admin_add_video_start(update: Update, context: ContextTypes.DEFAULT_TY
         for cid, name, _ in courses
     ]
     await update.message.reply_text(
-        "درس مربوط به ویدیو را انتخاب کنید:\n\n/cancel برای لغو",
+        "درس مربوط به ویدیو را انتخاب کنید:\n\n"
+        "برای لغو: /cancel یا «🏠 منوی اصلی»",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await update.message.reply_text(
+        "یکی از دروس زیر را انتخاب کنید:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     return ADD_VIDEO_COURSE
@@ -890,17 +914,22 @@ async def admin_add_video_course(update: Update, context: ContextTypes.DEFAULT_T
 
 async def admin_add_video_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     title = normalize_digits(update.message.text.strip())
+    if title in ("🏠 منوی اصلی", "/cancel"):
+        return await cancel(update, context)
     context.user_data["add_video_title"] = title
     context.user_data["add_video_episode"] = extract_episode(title)
     await update.message.reply_text(
-        "حالا لینک نماشا را بفرستید:\nhttps://www.namasha.com/v/xxxxxx"
+        "حالا لینک نماشا را بفرستید:\nhttps://www.namasha.com/v/xxxxxx\n\n"
+        "مثال: https://www.namasha.com/v/xxxxxx"
     )
     return ADD_VIDEO_URL
 
 
 async def admin_add_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
-    if "namasha.com" not in url:
+    if url in ("🏠 منوی اصلی", "/cancel"):
+        return await cancel(update, context)
+    if not is_valid_namasha_url(url):
         await update.message.reply_text(
             "لینک معتبر نیست. لینک باید از namasha.com باشد. دوباره بفرستید:"
         )
@@ -938,7 +967,12 @@ async def admin_delete_video_start(update: Update, context: ContextTypes.DEFAULT
         for cid, name, _ in courses
     ]
     await update.message.reply_text(
-        "درس مورد نظر برای حذف ویدیو را انتخاب کنید:\n\n/cancel برای لغو",
+        "درس مورد نظر برای حذف ویدیو را انتخاب کنید:\n\n"
+        "برای لغو: /cancel یا «🏠 منوی اصلی»",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await update.message.reply_text(
+        "یکی از دروس زیر را انتخاب کنید:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     return DELETE_VIDEO_SELECT
@@ -1034,7 +1068,12 @@ async def admin_edit_video_start(update: Update, context: ContextTypes.DEFAULT_T
         for cid, name, _ in courses
     ]
     await update.message.reply_text(
-        "درس مربوط به ویدیو را انتخاب کنید:\n\n/cancel برای لغو",
+        "درس مربوط به ویدیو را انتخاب کنید:\n\n"
+        "برای لغو: /cancel یا «🏠 منوی اصلی»",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await update.message.reply_text(
+        "یکی از دروس زیر را انتخاب کنید:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     return EDIT_VIDEO_SELECT
@@ -1120,10 +1159,12 @@ async def admin_edit_video_value(update: Update, context: ContextTypes.DEFAULT_T
     video_id = context.user_data.get("edit_video_id")
     field = context.user_data.get("edit_video_field")
     value = normalize_digits(update.message.text.strip())
+    if value in ("🏠 منوی اصلی", "/cancel"):
+        return await cancel(update, context)
     if not video_id or not field:
         await update.message.reply_text("خطا در ویرایش.", reply_markup=admin_keyboard())
         return ConversationHandler.END
-    if field == "url" and "namasha.com" not in value:
+    if field == "url" and not is_valid_namasha_url(value):
         await update.message.reply_text("لینک معتبر نیست. دوباره بفرستید:")
         return EDIT_VIDEO_VALUE
 
@@ -1211,7 +1252,10 @@ def main():
         states={
             ADD_COURSE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_course_name)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+        CommandHandler("cancel", cancel),
+        MessageHandler(filters.Regex("^🏠 منوی اصلی$"), cancel),
+    ],
         allow_reentry=True,
     )
     edit_course_conv = ConversationHandler(
@@ -1224,7 +1268,10 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_course_name)
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+        CommandHandler("cancel", cancel),
+        MessageHandler(filters.Regex("^🏠 منوی اصلی$"), cancel),
+    ],
         allow_reentry=True,
     )
     delete_course_conv = ConversationHandler(
@@ -1237,7 +1284,10 @@ def main():
                 CallbackQueryHandler(admin_delete_course_confirm, pattern=r"^delcourse_(yes|no)$")
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+        CommandHandler("cancel", cancel),
+        MessageHandler(filters.Regex("^🏠 منوی اصلی$"), cancel),
+    ],
         allow_reentry=True,
     )
     add_video_conv = ConversationHandler(
@@ -1247,7 +1297,10 @@ def main():
             ADD_VIDEO_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_video_title)],
             ADD_VIDEO_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_video_url)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+        CommandHandler("cancel", cancel),
+        MessageHandler(filters.Regex("^🏠 منوی اصلی$"), cancel),
+    ],
         allow_reentry=True,
     )
     delete_video_conv = ConversationHandler(
@@ -1258,7 +1311,10 @@ def main():
                 CallbackQueryHandler(admin_delete_video_confirm, pattern=r"^delvid_confirm_")
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+        CommandHandler("cancel", cancel),
+        MessageHandler(filters.Regex("^🏠 منوی اصلی$"), cancel),
+    ],
         allow_reentry=True,
     )
     edit_video_conv = ConversationHandler(
@@ -1272,7 +1328,10 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_video_value)
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+        CommandHandler("cancel", cancel),
+        MessageHandler(filters.Regex("^🏠 منوی اصلی$"), cancel),
+    ],
         allow_reentry=True,
     )
 
