@@ -78,6 +78,48 @@ SECTION_LABELS = {
     SECTION_EXAMS: "📝 نمونه سوالات و امتحانات",
 }
 
+import hashlib
+
+SECTION_CODE = {SECTION_MATERIALS: "m", SECTION_EXAMS: "e"}
+CODE_TO_SECTION = {"m": SECTION_MATERIALS, "e": SECTION_EXAMS}
+
+
+def pack_category_callback(prefix: str, course_id: int, section: str, category: str) -> str:
+    """callback_data حداکثر ۶۴ بایت؛ نام دسته یا هش پایدار."""
+    sec = SECTION_CODE.get(section, "x")
+    raw = f"{prefix}_{course_id}_{sec}_{category}"
+    if len(raw.encode("utf-8")) <= 64:
+        return raw
+    h = hashlib.sha1(f"{course_id}:{section}:{category}".encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}_{course_id}_{sec}_H{h}"
+
+
+def resolve_category_from_callback(data: str, prefix: str) -> tuple:
+    """برمی‌گرداند (course_id, section, category) یا (None, None, None)."""
+    if not data.startswith(prefix + "_"):
+        return None, None, None
+    rest = data[len(prefix) + 1 :]
+    parts = rest.split("_", 2)
+    if len(parts) < 3:
+        return None, None, None
+    try:
+        course_id = int(parts[0])
+    except ValueError:
+        return None, None, None
+    sec_code = parts[1]
+    section = CODE_TO_SECTION.get(sec_code)
+    if not section:
+        return None, None, None
+    cat_part = parts[2]
+    if cat_part.startswith("H") and len(cat_part) == 17:
+        target = cat_part[1:]
+        for cat in get_material_categories(course_id, section):
+            h = hashlib.sha1(f"{course_id}:{section}:{cat}".encode("utf-8")).hexdigest()[:16]
+            if h == target:
+                return course_id, section, cat
+        return None, None, None
+    return course_id, section, cat_part
+
 
 def normalize_digits(text: str) -> str:
     if not text:
@@ -862,11 +904,14 @@ async def show_material_categories(update, context, course_id, section):
         )
         return
     buttons = [
-        [InlineKeyboardButton(f"📁 {cat}", callback_data=f"mcat_{course_id}_{section}_{i}")]
-        for i, cat in enumerate(cats)
+        [
+            InlineKeyboardButton(
+                f"📁 {cat}",
+                callback_data=pack_category_callback("mcat", course_id, section, cat),
+            )
+        ]
+        for cat in cats
     ]
-    # store cats in context is hard across users; encode index and reload
-    context.application.bot_data.setdefault("mat_cats", {})[f"{course_id}_{section}"] = cats
     buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"course_{course_id}")])
     text = f"{label}\n\n📘 <b>{safe_text(course[1])}</b>\n\nیک دسته را انتخاب کنید:"
     await update.callback_query.edit_message_text(
@@ -877,18 +922,10 @@ async def show_material_categories(update, context, course_id, section):
 async def material_category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    # mcat_{course_id}_{section}_{index}
-    parts = q.data.split("_", 3)
-    course_id = int(parts[1])
-    section = parts[2]
-    idx = int(parts[3])
-    cats = context.application.bot_data.get("mat_cats", {}).get(f"{course_id}_{section}")
-    if not cats:
-        cats = get_material_categories(course_id, section)
-    if idx >= len(cats):
-        await q.edit_message_text("دسته پیدا نشد.")
+    course_id, section, category = resolve_category_from_callback(q.data, "mcat")
+    if course_id is None or not category:
+        await q.edit_message_text("دسته پیدا نشد. دوباره از لیست درس انتخاب کنید.")
         return
-    category = cats[idx]
     await show_material_list(update, context, course_id, section, category)
 
 
@@ -1241,6 +1278,11 @@ async def admin_add_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def admin_add_video_dl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.text:
+        await update.message.reply_text(
+            "لطفاً لینک دانلود را به‌صورت متن بفرستید، یا بنویسید: ندارد"
+        )
+        return ADD_VIDEO_DL
     text = update.message.text.strip()
     if text in ("🏠 منوی اصلی", "/cancel"):
         return await cancel(update, context)
@@ -1449,6 +1491,13 @@ async def admin_edit_video_value(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("خطا.", reply_markup=admin_keyboard())
         return ConversationHandler.END
 
+    # برای فیلدهای متنی، فایل/عکس قبول نیست
+    if field != "tg" and not (update.message and update.message.text):
+        await update.message.reply_text(
+            "لطفاً فقط پیام متنی بفرستید (نه عکس یا فایل)."
+        )
+        return EDIT_VIDEO_VALUE
+
     if field == "tg":
         if update.message.text:
             t = update.message.text.strip()
@@ -1534,10 +1583,15 @@ async def admin_mat_section(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["mat_section"] = section
     course_id = context.user_data["mat_course_id"]
     cats = get_material_categories(course_id, section)
-    buttons = [[InlineKeyboardButton(f"📁 {c}", callback_data=f"mat_cat_i_{i}")] for i, c in enumerate(cats)]
-    context.application.bot_data.setdefault("admin_mat_cats", {})[
-        f"{update.effective_user.id}"
-    ] = cats
+    buttons = [
+        [
+            InlineKeyboardButton(
+                f"📁 {c}",
+                callback_data=pack_category_callback("amat", course_id, section, c),
+            )
+        ]
+        for c in cats
+    ]
     buttons.append([InlineKeyboardButton("➕ دسته جدید", callback_data="mat_cat_new")])
     await q.edit_message_text("دسته را انتخاب یا بسازید:", reply_markup=InlineKeyboardMarkup(buttons))
     return MAT_CATEGORY
@@ -1552,16 +1606,13 @@ async def admin_mat_category(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "مثال: کتاب مرجع / جزوه تایپی / میان‌ترم ۱۴۰۲"
         )
         return MAT_CAT_NAME
-    idx = int(q.data.replace("mat_cat_i_", ""))
-    cats = context.application.bot_data.get("admin_mat_cats", {}).get(
-        str(update.effective_user.id), []
-    )
-    if idx >= len(cats):
-        await q.edit_message_text("دسته نامعتبر.")
+    _cid, _sec, category = resolve_category_from_callback(q.data, "amat")
+    if not category:
+        await q.edit_message_text("دسته نامعتبر. دوباره تلاش کنید.")
         return ConversationHandler.END
-    context.user_data["mat_category"] = cats[idx]
+    context.user_data["mat_category"] = category
     await q.edit_message_text(
-        f"دسته: <b>{safe_text(cats[idx])}</b>\n\n"
+        f"دسته: <b>{safe_text(category)}</b>\n\n"
         "عنوان این فایل را بنویسید (اختیاری — می‌توانید «-» بفرستید):",
         parse_mode=ParseMode.HTML,
     )
@@ -1675,24 +1726,58 @@ async def admin_del_mat_course(update: Update, context: ContextTypes.DEFAULT_TYP
     return DEL_MAT_SECTION
 
 
+async def _show_del_mat_page(update, context, course_id, section, page=0, edit=True):
+    rows = list_materials_for_course(course_id, section)
+    if not rows:
+        if edit and update.callback_query:
+            await update.callback_query.edit_message_text("موردی نیست.")
+            await context.bot.send_message(
+                update.callback_query.message.chat_id, "پنل:", reply_markup=admin_keyboard()
+            )
+        return ConversationHandler.END
+    items = []
+    for mid, cat, title, ftype in rows:
+        label = f"{cat} — {title or ftype}"
+        items.append(
+            [InlineKeyboardButton(f"🗑 {label}"[:50], callback_data=f"dmat_i_{mid}")]
+        )
+    markup, total, start, end = paginate_buttons(
+        items, page, PAGE_SIZE, f"dmatp_{course_id}_{section[:1]}"
+    )
+    # note: paginate prefix pattern handled below
+    text = f"برای حذف (نمایش {start+1} تا {min(end, total)} از {total}):"
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=markup)
+    return DEL_MAT_ITEM
+
+
 async def admin_del_mat_section(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     section = q.data.replace("dmat_s_", "")
     course_id = context.user_data["dmat_course"]
-    rows = list_materials_for_course(course_id, section)
-    if not rows:
-        await q.edit_message_text("موردی نیست.")
-        await context.bot.send_message(q.message.chat_id, "پنل:", reply_markup=admin_keyboard())
-        return ConversationHandler.END
-    buttons = []
-    for mid, cat, title, ftype in rows:
-        label = f"{cat} — {title or ftype}"
-        buttons.append(
-            [InlineKeyboardButton(f"🗑 {label}"[:50], callback_data=f"dmat_i_{mid}")]
-        )
-    await q.edit_message_text("برای حذف:", reply_markup=InlineKeyboardMarkup(buttons))
-    return DEL_MAT_ITEM
+    context.user_data["dmat_section"] = section
+    return await _show_del_mat_page(update, context, course_id, section, page=0)
+
+
+async def admin_del_mat_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """صفحه‌بندی لیست حذف جزوه: dmatp_{course_id}_{s}_page_{n}"""
+    q = update.callback_query
+    await q.answer()
+    # dmatp_12_m_page_0
+    body = q.data[len("dmatp_"):]
+    parts = body.rsplit("_page_", 1)
+    if len(parts) != 2:
+        return DEL_MAT_ITEM
+    head, page_s = parts
+    page = int(page_s)
+    # head = {course_id}_{s}
+    cid_s, sec_code = head.rsplit("_", 1)
+    course_id = int(cid_s)
+    section = CODE_TO_SECTION.get(sec_code, context.user_data.get("dmat_section", SECTION_MATERIALS))
+    context.user_data["dmat_course"] = course_id
+    context.user_data["dmat_section"] = section
+    return await _show_del_mat_page(update, context, course_id, section, page=page)
 
 
 async def admin_del_mat_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1819,7 +1904,10 @@ def main():
             ADD_VIDEO_COURSE: [CallbackQueryHandler(admin_add_video_course, pattern=r"^addvid_course_")],
             ADD_VIDEO_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_video_title)],
             ADD_VIDEO_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_video_url)],
-            ADD_VIDEO_DL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_video_dl)],
+            ADD_VIDEO_DL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_video_dl),
+                MessageHandler(~filters.TEXT & ~filters.COMMAND, admin_add_video_dl),
+            ],
             ADD_VIDEO_TG: [
                 MessageHandler(filters.VIDEO | filters.Document.ALL, admin_add_video_tg),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_video_tg),
@@ -1855,7 +1943,9 @@ def main():
         states={
             MAT_COURSE: [CallbackQueryHandler(admin_mat_course, pattern=r"^mat_course_")],
             MAT_SECTION: [CallbackQueryHandler(admin_mat_section, pattern=r"^mat_sec_")],
-            MAT_CATEGORY: [CallbackQueryHandler(admin_mat_category, pattern=r"^mat_cat_")],
+            MAT_CATEGORY: [
+                CallbackQueryHandler(admin_mat_category, pattern=r"^(mat_cat_new|amat_)"),
+            ],
             MAT_CAT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_mat_cat_name)],
             MAT_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_mat_title)],
             MAT_FILES: [
@@ -1871,7 +1961,10 @@ def main():
         states={
             DEL_MAT_COURSE: [CallbackQueryHandler(admin_del_mat_course, pattern=r"^dmat_c_")],
             DEL_MAT_SECTION: [CallbackQueryHandler(admin_del_mat_section, pattern=r"^dmat_s_")],
-            DEL_MAT_ITEM: [CallbackQueryHandler(admin_del_mat_item, pattern=r"^dmat_i_")],
+            DEL_MAT_ITEM: [
+                CallbackQueryHandler(admin_del_mat_item, pattern=r"^dmat_i_"),
+                CallbackQueryHandler(admin_del_mat_page, pattern=r"^dmatp_"),
+            ],
             DEL_MAT_CONFIRM: [CallbackQueryHandler(admin_del_mat_confirm, pattern=r"^dmat_(yes|no)$")],
         },
         fallbacks=fb,
