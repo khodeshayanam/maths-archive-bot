@@ -1,6 +1,8 @@
 import os
 import re
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime
 from typing import Optional, List, Tuple
 from contextlib import contextmanager
@@ -1849,6 +1851,47 @@ def _fallbacks():
     ]
 
 
+class _HealthCheckHandler(BaseHTTPRequestHandler):
+    """هندلر خیلی ساده فقط برای جواب دادن به health check سرویس‌هایی مثل Render."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write("Bot is running.".encode("utf-8"))
+
+    def log_message(self, format, *args):
+        # جلوگیری از شلوغ شدن لاگ‌ها با درخواست‌های health check
+        pass
+
+
+def _start_fake_webserver():
+    """
+    بعضی سرویس‌های هاست (مثل Render در حالت Web Service) انتظار دارن
+    برنامه روی یک پورت گوش بده، وگرنه سرویس رو ناسالم/تایم‌اوت در نظر می‌گیرن.
+    این ربات فقط polling می‌کنه و پورتی باز نمی‌کنه، پس یک سرور HTTP خیلی
+    سبک و ساختگی توی یک ترد جدا بالا می‌آوریم که فقط به health check جواب بده.
+    اگر متغیر محیطی PORT ست نشده باشه (مثلاً روی Railway یا اجرای لوکال)، این
+    سرور اصلاً راه‌اندازی نمی‌شود.
+    """
+    port_str = os.getenv("PORT")
+    if not port_str:
+        return
+    try:
+        port = int(port_str)
+    except ValueError:
+        print(f"⚠️ مقدار PORT نامعتبر است: {port_str}")
+        return
+
+    def _run():
+        server = HTTPServer(("0.0.0.0", port), _HealthCheckHandler)
+        server.serve_forever()
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    print(f"🌐 وب‌سرور سبک برای health check روی پورت {port} راه‌اندازی شد.")
+
+
 def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN تنظیم نشده.")
@@ -1858,6 +1901,8 @@ def main():
         return
     init_db()
     print("✅ PostgreSQL آماده است.")
+
+    _start_fake_webserver()
 
     app = (
         Application.builder()
