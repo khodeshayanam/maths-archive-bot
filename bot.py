@@ -175,11 +175,20 @@ def episode_sort_key(episode: Optional[str]) -> Tuple[int, int, str]:
         return (10**9, 0, ep)
 
 
+def _db_url() -> str:
+    """برای Supabase در صورت نیاز sslmode=require اضافه می‌شود."""
+    url = DATABASE_URL or ""
+    if "sslmode=" not in url and ("supabase.com" in url or "pooler.supabase" in url):
+        join = "&" if "?" in url else "?"
+        url = f"{url}{join}sslmode=require"
+    return url
+
+
 @contextmanager
 def get_connection():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL تنظیم نشده است.")
-    conn = psycopg.connect(DATABASE_URL)
+    conn = psycopg.connect(_db_url())
     try:
         yield conn
         conn.commit()
