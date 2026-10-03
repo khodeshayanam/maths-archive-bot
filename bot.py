@@ -644,6 +644,58 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# دکمه‌های منو/پنل که نباید به‌عنوان ورودی مراحل (مثلاً لینک نماشا) تفسیر شوند
+MENU_BUTTON_PATTERN = (
+    r"^(🏠 منوی اصلی|🔙 بازگشت به منوی اصلی|"
+    r"📚 لیست دروس|🔍 جستجو|🆕 آخرین ویدیوها|📖 راهنما|"
+    r"⚙️ پنل مدیریت|📊 آمار|"
+    r"➕ افزودن درس|✏️ ویرایش درس|🗑 حذف درس|"
+    r"🎬 افزودن ویدیو|✏️ ویرایش ویدیو|🗑 حذف ویدیو|"
+    r"📎 افزودن جزوه/سوال|🗑 حذف جزوه/سوال)$"
+)
+
+
+def text_input_filter():
+    """متن کاربر، به‌جز دکمه‌های منو و دستورات."""
+    return filters.TEXT & ~filters.COMMAND & ~filters.Regex(MENU_BUTTON_PATTERN)
+
+
+async def cancel_and_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """خروج از Conversation و اجرای همان دکمهٔ منو."""
+    context.user_data.clear()
+    text = (update.message.text or "").strip() if update.message else ""
+    uid = update.effective_user.id
+
+    if text in ("🏠 منوی اصلی", "🔙 بازگشت به منوی اصلی"):
+        await back_to_main(update, context)
+    elif text == "📚 لیست دروس":
+        await show_courses(update, context)
+    elif text == "🔍 جستجو":
+        await search_start(update, context)
+    elif text == "🆕 آخرین ویدیوها":
+        await latest_videos(update, context)
+    elif text == "📖 راهنما":
+        await help_command(update, context)
+    elif text == "⚙️ پنل مدیریت":
+        await admin_panel(update, context)
+    elif text == "📊 آمار":
+        if is_admin(uid):
+            await admin_stats(update, context)
+        else:
+            await update.effective_message.reply_text(
+                "دسترسی ندارید.",
+                reply_markup=main_keyboard(False),
+            )
+    else:
+        # دکمه‌های دیگر پنل ادمین: فقط لغو؛ کاربر دوباره همان دکمه را بزند
+        kb = admin_keyboard() if is_admin(uid) else main_keyboard(False)
+        await update.effective_message.reply_text(
+            "عملیات قبلی لغو شد. دوباره دکمهٔ مورد نظر را بزنید.",
+            reply_markup=kb,
+        )
+    return ConversationHandler.END
+
+
 # ---------- user handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1856,7 +1908,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _fallbacks():
     return [
         CommandHandler("cancel", cancel),
-        MessageHandler(filters.Regex("^🏠 منوی اصلی$"), cancel),
+        MessageHandler(filters.Regex(MENU_BUTTON_PATTERN), cancel_and_route),
     ]
 
 
@@ -1930,7 +1982,7 @@ def main():
 
     add_course_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^➕ افزودن درس$"), admin_add_course_start)],
-        states={ADD_COURSE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_course_name)]},
+        states={ADD_COURSE_NAME: [MessageHandler(text_input_filter(), admin_add_course_name)]},
         fallbacks=fb,
         allow_reentry=True,
     )
@@ -1938,7 +1990,7 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^✏️ ویرایش درس$"), admin_edit_course_start)],
         states={
             EDIT_COURSE_SELECT: [CallbackQueryHandler(admin_edit_course_select, pattern=r"^editcourse_")],
-            EDIT_COURSE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_course_name)],
+            EDIT_COURSE_NAME: [MessageHandler(text_input_filter(), admin_edit_course_name)],
         },
         fallbacks=fb,
         allow_reentry=True,
@@ -1956,15 +2008,15 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^🎬 افزودن ویدیو$"), admin_add_video_start)],
         states={
             ADD_VIDEO_COURSE: [CallbackQueryHandler(admin_add_video_course, pattern=r"^addvid_course_")],
-            ADD_VIDEO_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_video_title)],
-            ADD_VIDEO_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_video_url)],
+            ADD_VIDEO_TITLE: [MessageHandler(text_input_filter(), admin_add_video_title)],
+            ADD_VIDEO_URL: [MessageHandler(text_input_filter(), admin_add_video_url)],
             ADD_VIDEO_DL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_video_dl),
+                MessageHandler(text_input_filter(), admin_add_video_dl),
                 MessageHandler(~filters.TEXT & ~filters.COMMAND, admin_add_video_dl),
             ],
             ADD_VIDEO_TG: [
                 MessageHandler(filters.VIDEO | filters.Document.ALL, admin_add_video_tg),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_video_tg),
+                MessageHandler(text_input_filter(), admin_add_video_tg),
             ],
         },
         fallbacks=fb,
@@ -1986,7 +2038,7 @@ def main():
             EDIT_VIDEO_FIELD: [CallbackQueryHandler(admin_edit_video_field, pattern=r"^editvid_field_")],
             EDIT_VIDEO_VALUE: [
                 MessageHandler(filters.VIDEO | filters.Document.ALL, admin_edit_video_value),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_video_value),
+                MessageHandler(text_input_filter(), admin_edit_video_value),
             ],
         },
         fallbacks=fb,
@@ -2000,11 +2052,11 @@ def main():
             MAT_CATEGORY: [
                 CallbackQueryHandler(admin_mat_category, pattern=r"^(mat_cat_new|amat_)"),
             ],
-            MAT_CAT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_mat_cat_name)],
-            MAT_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_mat_title)],
+            MAT_CAT_NAME: [MessageHandler(text_input_filter(), admin_mat_cat_name)],
+            MAT_TITLE: [MessageHandler(text_input_filter(), admin_mat_title)],
             MAT_FILES: [
                 MessageHandler(filters.PHOTO | filters.Document.ALL, admin_mat_files),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_mat_files),
+                MessageHandler(text_input_filter(), admin_mat_files),
             ],
         },
         fallbacks=fb,
