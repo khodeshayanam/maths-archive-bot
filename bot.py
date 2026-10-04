@@ -1913,13 +1913,23 @@ def _fallbacks():
 
 
 class _HealthCheckHandler(BaseHTTPRequestHandler):
-    """هندلر خیلی ساده فقط برای جواب دادن به health check سرویس‌هایی مثل Render."""
+    """هندلر خیلی ساده فقط برای جواب دادن به health check سرویس‌هایی مثل Render/UptimeRobot."""
 
     def do_GET(self):
+        body = b"Bot is running."
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write("Bot is running.".encode("utf-8"))
+        self.wfile.write(body)
+
+    def do_HEAD(self):
+        # UptimeRobot اغلب با HEAD چک می‌کند؛ بدون این متد خطای 501 می‌دهد
+        body = b"Bot is running."
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
 
     def log_message(self, format, *args):
         # جلوگیری از شلوغ شدن لاگ‌ها با درخواست‌های health check
