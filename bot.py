@@ -432,6 +432,72 @@ def delete_video(video_id: int) -> bool:
         return c.rowcount > 0
 
 
+EXCLUDE_AUTOLINK = ("داده کاوی دکتر دهقان", "داده کاوی")
+
+
+def clean_caption_for_match(caption: str) -> str:
+    text = caption or ""
+    text = re.sub(r"#\S+", " ", text)
+    text = normalize_digits(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def find_video_for_autolink(caption: str):
+    """
+    فقط ردیف موجود را پیدا می‌کند؛ چیزی اضافه نمی‌کند.
+    خروجی: (id, title, episode, course_name, telegram_file_id) یا None
+    """
+    text = clean_caption_for_match(caption)
+    if not text:
+        return None
+    low = text.replace("‌", " ")
+    for bad in EXCLUDE_AUTOLINK:
+        if bad in low:
+            return None
+
+    with get_connection() as conn:
+        c = conn.cursor()
+        # 1) تطبیق دقیق عنوان
+        c.execute(
+            """
+            SELECT v.id, v.title, v.episode, c.name, v.telegram_file_id
+            FROM videos v
+            JOIN courses c ON v.course_id = c.id
+            WHERE v.title = %s
+            LIMIT 1
+            """,
+            (text,),
+        )
+        row = c.fetchone()
+        if row:
+            return row
+
+        # 2) عنوان داخل کپشن یا برعکس
+        c.execute(
+            """
+            SELECT v.id, v.title, v.episode, c.name, v.telegram_file_id
+            FROM videos v
+            JOIN courses c ON v.course_id = c.id
+            WHERE %s ILIKE '%%' || v.title || '%%'
+               OR v.title ILIKE '%%' || %s || '%%'
+            ORDER BY LENGTH(v.title) DESC
+            LIMIT 5
+            """,
+            (text, text),
+        )
+        rows = c.fetchall()
+        if len(rows) == 1:
+            return rows[0]
+        if rows:
+            # ترجیح عنوان کوتاه‌تر که کامل داخل کپشن باشد
+            for r in rows:
+                if r[1] and r[1] in text:
+                    return r
+            return rows[0]
+    return None
+
+
 def search_all(query: str) -> List[Tuple]:
     """Search videos: returns (vid_id, title, episode, course_name)"""
     q = normalize_digits(query.strip())
@@ -1963,6 +2029,79 @@ def _start_fake_webserver():
     print(f"🌐 وب‌سرور سبک برای health check روی پورت {port} راه‌اندازی شد.")
 
 
+
+async def autolink_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حالت اتصال فایل تلگرام به ویدیوهای موجود (فقط ادمین)."""
+    if not is_admin(update.effective_user.id):
+        return
+    context.user_data["autolink"] = True
+    await update.message.reply_text(
+        "🔗 حالت اتصال فایل روشن شد.\n\n"
+        "ویدیوها را از کانال آرشیو *فوروارد* کن.\n"
+        "ربات فقط ردیف‌های از قبل موجود را پر می‌کند؛ درس/ویدیو جدید نمی‌سازد.\n"
+        "داده کاوی نادیده گرفته می‌شود.\n\n"
+        "برای خاموش کردن: /autolink_off",
+        parse_mode=None,
+    )
+
+
+async def autolink_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    context.user_data["autolink"] = False
+    await update.message.reply_text("🔗 حالت اتصال فایل خاموش شد.")
+
+
+async def autolink_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """وقتی autolink روشن است، ویدیو/فایل فورواردشده را به ردیف موجود وصل می‌کند."""
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.user_data.get("autolink"):
+        return
+    msg = update.message
+    if not msg:
+        return
+
+    tg_id = None
+    if msg.video:
+        tg_id = msg.video.file_id
+    elif msg.document and (
+        (msg.document.mime_type or "").startswith("video/")
+        or (msg.document.file_name or "").lower().endswith((".mp4", ".mkv", ".webm"))
+    ):
+        tg_id = msg.document.file_id
+    if not tg_id:
+        return
+
+    caption = msg.caption or msg.text or ""
+    if not caption.strip():
+        await msg.reply_text("⚠️ کپشن خالی است؛ رد شد.")
+        return
+
+    cleaned = clean_caption_for_match(caption)
+    for bad in EXCLUDE_AUTOLINK:
+        if bad in cleaned.replace("‌", " "):
+            await msg.reply_text(f"⏭ رد شد (داده کاوی): {cleaned[:80]}")
+            return
+
+    row = find_video_for_autolink(caption)
+    if not row:
+        await msg.reply_text(
+            f"❌ در دیتابیس پیدا نشد (چیزی اضافه نشد):\n{cleaned[:120]}"
+        )
+        return
+
+    vid_id, title, episode, course_name, old_tg = row
+    update_video(vid_id, telegram_file_id=tg_id)
+    status = "جایگزین شد" if old_tg else "وصل شد"
+    await msg.reply_text(
+        f"✅ {status}\n"
+        f"درس: {course_name}\n"
+        f"عنوان: {title}\n"
+        f"قسمت: {episode or '—'}"
+    )
+
+
 def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN تنظیم نشده.")
@@ -2091,6 +2230,14 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("autolink", autolink_on))
+    app.add_handler(CommandHandler("autolink_off", autolink_off))
+    app.add_handler(
+        MessageHandler(
+            (filters.VIDEO | filters.Document.ALL) & filters.User(list(ADMIN_IDS)),
+            autolink_media,
+        )
+    )
     app.add_handler(add_course_conv)
     app.add_handler(edit_course_conv)
     app.add_handler(delete_course_conv)
