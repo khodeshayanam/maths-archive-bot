@@ -432,69 +432,113 @@ def delete_video(video_id: int) -> bool:
         return c.rowcount > 0
 
 
-EXCLUDE_AUTOLINK = ("داده کاوی دکتر دهقان", "داده کاوی")
-
-
 def clean_caption_for_match(caption: str) -> str:
     text = caption or ""
     text = re.sub(r"#\S+", " ", text)
     text = normalize_digits(text)
+    text = text.replace("‌", " ")
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
+def _extract_episode_num(text: str):
+    """شماره قسمت را از متن درمی‌آورد (مثلاً قسمت 12 یا جلسه 3)."""
+    m = re.search(r"(?:قسمت|جلسه)\s*([0-9]+(?:[\\./][0-9]+)?)", text)
+    if m:
+        return normalize_digits(m.group(1))
+    return None
+
+
 def find_video_for_autolink(caption: str):
     """
-    فقط ردیف موجود را پیدا می‌کند؛ چیزی اضافه نمی‌کند.
-    خروجی: (id, title, episode, course_name, telegram_file_id) یا None
+    تطبیق سخت‌گیرانه: فقط ردیف موجود.
+    - اول عنوان دقیق
+    - بعد عنوان کامل داخل کپشن
+    - در صورت ابهام: None (هرگز حدس نمی‌زند)
     """
     text = clean_caption_for_match(caption)
-    if not text:
+    if not text or len(text) < 5:
         return None
-    low = text.replace("‌", " ")
-    for bad in EXCLUDE_AUTOLINK:
-        if bad in low:
-            return None
+
+    ep = _extract_episode_num(text)
 
     with get_connection() as conn:
         c = conn.cursor()
-        # 1) تطبیق دقیق عنوان
+
+        # 1) عنوان دقیقاً برابر کپشن پاک‌شده
         c.execute(
             """
             SELECT v.id, v.title, v.episode, c.name, v.telegram_file_id
             FROM videos v
             JOIN courses c ON v.course_id = c.id
             WHERE v.title = %s
-            LIMIT 1
+            LIMIT 2
             """,
             (text,),
         )
-        row = c.fetchone()
-        if row:
-            return row
+        rows = c.fetchall()
+        if len(rows) == 1:
+            return rows[0]
 
-        # 2) عنوان داخل کپشن یا برعکس
+        # 2) عنوان ویدیو کامل داخل کپشن باشد (نه برعکس شل)
         c.execute(
             """
             SELECT v.id, v.title, v.episode, c.name, v.telegram_file_id
             FROM videos v
             JOIN courses c ON v.course_id = c.id
-            WHERE %s ILIKE '%%' || v.title || '%%'
-               OR v.title ILIKE '%%' || %s || '%%'
+            WHERE LENGTH(v.title) >= 8
+              AND %s LIKE '%%' || v.title || '%%'
             ORDER BY LENGTH(v.title) DESC
-            LIMIT 5
+            LIMIT 10
             """,
-            (text, text),
+            (text,),
         )
         rows = c.fetchall()
-        if len(rows) == 1:
-            return rows[0]
-        if rows:
-            # ترجیح عنوان کوتاه‌تر که کامل داخل کپشن باشد
+        # فقط آن‌هایی که عنوان واقعاً زیر‌رشته کپشن است
+        strict = [r for r in rows if r[1] and r[1] in text]
+        if len(strict) == 1:
+            return strict[0]
+        if len(strict) > 1 and ep:
+            ep_match = [
+                r for r in strict
+                if normalize_digits(str(r[2] or "")) == ep
+                or ep in normalize_digits(str(r[1] or ""))
+            ]
+            if len(ep_match) == 1:
+                return ep_match[0]
+
+        # 3) نام درس + شماره قسمت
+        if ep:
+            c.execute(
+                """
+                SELECT v.id, v.title, v.episode, c.name, v.telegram_file_id
+                FROM videos v
+                JOIN courses c ON v.course_id = c.id
+                WHERE (
+                    normalize_digits(COALESCE(v.episode, '')) = %s
+                    OR v.title LIKE '%%قسمت ' || %s || '%%'
+                    OR v.title LIKE '%%قسمت' || %s || '%%'
+                )
+                AND (
+                    %s LIKE '%%' || c.name || '%%'
+                    OR c.name LIKE '%%' || split_part(%s, ' - ', 1) || '%%'
+                )
+                LIMIT 5
+                """,
+                (ep, ep, ep, text, text),
+            )
+            rows = c.fetchall()
+            # فیلتر: کلمات کلیدی نام درس باید در کپشن باشد
+            good = []
             for r in rows:
-                if r[1] and r[1] in text:
-                    return r
-            return rows[0]
+                course = (r[3] or "").replace("‌", " ")
+                # حداقل یک تکه معنادار از نام درس (غیر از دکتر/قسمت)
+                tokens = [w for w in re.split(r"\s+", course) if len(w) >= 3 and w not in ("دکتر", "درس", "مبانی")]
+                if tokens and sum(1 for w in tokens if w in text) >= max(1, len(tokens) // 2):
+                    good.append(r)
+            if len(good) == 1:
+                return good[0]
+
     return None
 
 
@@ -2039,7 +2083,7 @@ async def autolink_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔗 حالت اتصال فایل روشن شد.\n\n"
         "ویدیوها را از کانال آرشیو *فوروارد* کن.\n"
         "ربات فقط ردیف‌های از قبل موجود را پر می‌کند؛ درس/ویدیو جدید نمی‌سازد.\n"
-        "داده کاوی نادیده گرفته می‌شود.\n\n"
+        ""
         "برای خاموش کردن: /autolink_off",
         parse_mode=None,
     )
@@ -2079,10 +2123,6 @@ async def autolink_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cleaned = clean_caption_for_match(caption)
-    for bad in EXCLUDE_AUTOLINK:
-        if bad in cleaned.replace("‌", " "):
-            await msg.reply_text(f"⏭ رد شد (داده کاوی): {cleaned[:80]}")
-            return
 
     row = find_video_for_autolink(caption)
     if not row:
