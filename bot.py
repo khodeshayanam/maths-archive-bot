@@ -442,19 +442,38 @@ def clean_caption_for_match(caption: str) -> str:
 
 
 def _extract_episode_num(text: str):
-    """شماره قسمت را از متن درمی‌آورد (مثلاً قسمت 12 یا جلسه 3)."""
-    m = re.search(r"(?:قسمت|جلسه)\s*([0-9]+(?:[\\./][0-9]+)?)", text)
-    if m:
-        return normalize_digits(m.group(1))
-    return None
+    """آخرین شماره قسمت/جلسه در متن (رقم کامل، نه پیشوند)."""
+    matches = re.findall(r"(?:قسمت|جلسه)\s*([0-9]+(?:[./][0-9]+)?)", text or "")
+    if not matches:
+        return None
+    return normalize_digits(matches[-1])
+
+
+def _title_fits_caption(title: str, caption: str) -> bool:
+    """عنوان باید داخل کپشن باشد؛ قسمت N نباید با قسمت N7 اشتباه شود."""
+    if not title or not caption or title not in caption:
+        return False
+    # اگر عنوان به «قسمت X» ختم می‌شود، بعد از X در کپشن نباید رقم ادامه داشته باشد
+    m = re.search(r"(قسمت|جلسه)\s*([0-9]+(?:[./][0-9]+)?)\s*$", title)
+    if not m:
+        return True
+    ep = m.group(2)
+    # محل عنوان در کپشن
+    idx = caption.find(title)
+    after = caption[idx + len(title) : idx + len(title) + 1]
+    if after and after[0].isdigit():
+        return False
+    # شماره قسمت عنوان و کپشن یکی باشد
+    cap_ep = _extract_episode_num(caption)
+    if cap_ep and normalize_digits(ep) != cap_ep:
+        return False
+    return True
 
 
 def find_video_for_autolink(caption: str):
     """
-    تطبیق سخت‌گیرانه: فقط ردیف موجود.
-    - اول عنوان دقیق
-    - بعد عنوان کامل داخل کپشن
-    - در صورت ابهام: None (هرگز حدس نمی‌زند)
+    تطبیق سخت‌گیرانه روی عنوان + شماره قسمت.
+    در ابهام: None (حدس نمی‌زند).
     """
     text = clean_caption_for_match(caption)
     if not text or len(text) < 5:
@@ -465,7 +484,7 @@ def find_video_for_autolink(caption: str):
     with get_connection() as conn:
         c = conn.cursor()
 
-        # 1) عنوان دقیقاً برابر کپشن پاک‌شده
+        # 1) عنوان دقیقاً برابر
         c.execute(
             """
             SELECT v.id, v.title, v.episode, c.name, v.telegram_file_id
@@ -480,64 +499,54 @@ def find_video_for_autolink(caption: str):
         if len(rows) == 1:
             return rows[0]
 
-        # 2) عنوان ویدیو کامل داخل کپشن باشد (نه برعکس شل)
+        # 2) همه عناوین همان درس‌هایی که نامشان در کپشن است + فیلتر قسمت
         c.execute(
             """
             SELECT v.id, v.title, v.episode, c.name, v.telegram_file_id
             FROM videos v
             JOIN courses c ON v.course_id = c.id
-            WHERE LENGTH(v.title) >= 8
-              AND %s LIKE '%%' || v.title || '%%'
+            WHERE LENGTH(COALESCE(v.title, '')) >= 8
             ORDER BY LENGTH(v.title) DESC
-            LIMIT 10
-            """,
-            (text,),
+            """
         )
-        rows = c.fetchall()
-        # فقط آن‌هایی که عنوان واقعاً زیر‌رشته کپشن است
-        strict = [r for r in rows if r[1] and r[1] in text]
-        if len(strict) == 1:
-            return strict[0]
-        if len(strict) > 1 and ep:
-            ep_match = [
-                r for r in strict
-                if normalize_digits(str(r[2] or "")) == ep
-                or ep in normalize_digits(str(r[1] or ""))
-            ]
-            if len(ep_match) == 1:
-                return ep_match[0]
+        all_rows = c.fetchall()
 
-        # 3) نام درس + شماره قسمت
-        if ep:
-            c.execute(
-                """
-                SELECT v.id, v.title, v.episode, c.name, v.telegram_file_id
-                FROM videos v
-                JOIN courses c ON v.course_id = c.id
-                WHERE (
-                    normalize_digits(COALESCE(v.episode, '')) = %s
-                    OR v.title LIKE '%%قسمت ' || %s || '%%'
-                    OR v.title LIKE '%%قسمت' || %s || '%%'
-                )
-                AND (
-                    %s LIKE '%%' || c.name || '%%'
-                    OR c.name LIKE '%%' || split_part(%s, ' - ', 1) || '%%'
-                )
-                LIMIT 5
-                """,
-                (ep, ep, ep, text, text),
-            )
-            rows = c.fetchall()
-            # فیلتر: کلمات کلیدی نام درس باید در کپشن باشد
-            good = []
-            for r in rows:
-                course = (r[3] or "").replace("‌", " ")
-                # حداقل یک تکه معنادار از نام درس (غیر از دکتر/قسمت)
-                tokens = [w for w in re.split(r"\s+", course) if len(w) >= 3 and w not in ("دکتر", "درس", "مبانی")]
-                if tokens and sum(1 for w in tokens if w in text) >= max(1, len(tokens) // 2):
-                    good.append(r)
-            if len(good) == 1:
-                return good[0]
+        candidates = []
+        for r in all_rows:
+            title = (r[1] or "").replace("‌", " ")
+            title = normalize_digits(title)
+            title = re.sub(r"\s+", " ", title).strip()
+            if not _title_fits_caption(title, text):
+                continue
+            if ep:
+                row_ep = normalize_digits(str(r[2] or ""))
+                title_ep = _extract_episode_num(title)
+                if row_ep and row_ep != ep and title_ep and title_ep != ep:
+                    continue
+                if row_ep and row_ep != ep and not title_ep:
+                    continue
+            candidates.append(r)
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        if len(candidates) > 1 and ep:
+            ep_exact = [
+                r
+                for r in candidates
+                if normalize_digits(str(r[2] or "")) == ep
+                or _extract_episode_num(r[1] or "") == ep
+            ]
+            if len(ep_exact) == 1:
+                return ep_exact[0]
+            # بلندترین عنوان بین ep_exact
+            if ep_exact:
+                ep_exact.sort(key=lambda r: len(r[1] or ""), reverse=True)
+                # فقط اگر یکی با همان طول حداکثر یکتا باشد
+                best_len = len(ep_exact[0][1] or "")
+                top = [r for r in ep_exact if len(r[1] or "") == best_len]
+                if len(top) == 1:
+                    return top[0]
 
     return None
 
