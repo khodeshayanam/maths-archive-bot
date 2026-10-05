@@ -435,6 +435,8 @@ def delete_video(video_id: int) -> bool:
 def clean_caption_for_match(caption: str) -> str:
     text = caption or ""
     text = re.sub(r"#\S+", " ", text)
+    # تاریخ‌هایی مثل 15/01/1405
+    text = re.sub(r"\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b", " ", text)
     text = normalize_digits(text)
     text = text.replace("‌", " ")
     text = re.sub(r"\s+", " ", text).strip()
@@ -442,111 +444,108 @@ def clean_caption_for_match(caption: str) -> str:
 
 
 def _extract_episode_num(text: str):
-    """آخرین شماره قسمت/جلسه در متن (رقم کامل، نه پیشوند)."""
-    matches = re.findall(r"(?:قسمت|جلسه)\s*([0-9]+(?:[./][0-9]+)?)", text or "")
+    """شماره قسمت از کپشن/عنوان (پشتیبانی 23-2)."""
+    matches = re.findall(
+        r"(?:قسمت|جلسه)\s*([0-9]+(?:\s*[-–./]\s*[0-9]+)?)",
+        text or "",
+    )
     if not matches:
         return None
-    return normalize_digits(matches[-1])
-
-
-def _title_fits_caption(title: str, caption: str) -> bool:
-    """عنوان باید داخل کپشن باشد؛ قسمت N نباید با قسمت N7 اشتباه شود."""
-    if not title or not caption or title not in caption:
-        return False
-    # اگر عنوان به «قسمت X» ختم می‌شود، بعد از X در کپشن نباید رقم ادامه داشته باشد
-    m = re.search(r"(قسمت|جلسه)\s*([0-9]+(?:[./][0-9]+)?)\s*$", title)
-    if not m:
-        return True
-    ep = m.group(2)
-    # محل عنوان در کپشن
-    idx = caption.find(title)
-    after = caption[idx + len(title) : idx + len(title) + 1]
-    if after and after[0].isdigit():
-        return False
-    # شماره قسمت عنوان و کپشن یکی باشد
-    cap_ep = _extract_episode_num(caption)
-    if cap_ep and normalize_digits(ep) != cap_ep:
-        return False
-    return True
+    ep = normalize_digits(matches[-1])
+    ep = re.sub(r"\s+", "", ep)
+    ep = ep.replace("–", "-")
+    return ep
 
 
 def find_video_for_autolink(caption: str):
     """
-    تطبیق سخت‌گیرانه روی عنوان + شماره قسمت.
-    در ابهام: None (حدس نمی‌زند).
+    تطبیق با کپشن کانال وقتی عنوان DB کوتاه است (مثل «قسمت 25»):
+    نام درس در کپشن + شماره قسمت.
     """
     text = clean_caption_for_match(caption)
     if not text or len(text) < 5:
         return None
 
     ep = _extract_episode_num(text)
+    if not ep:
+        return None
 
     with get_connection() as conn:
         c = conn.cursor()
 
-        # 1) عنوان دقیقاً برابر
+        # همه درس‌ها — بلندترین نامی که داخل کپشن است
+        c.execute("SELECT id, name FROM courses")
+        courses = c.fetchall()
+        matched_courses = []
+        for cid, name in courses:
+            n = normalize_digits((name or "").replace("‌", " "))
+            n = re.sub(r"\s+", " ", n).strip()
+            if len(n) < 4:
+                continue
+            if n in text:
+                matched_courses.append((cid, name, len(n)))
+            else:
+                # تطبیق تقریبی: حداقل ۲ توکن معنادار
+                tokens = [
+                    w
+                    for w in re.split(r"\s+", n)
+                    if len(w) >= 3 and w not in ("دکتر", "درس", "مبانی", "با", "در", "و")
+                ]
+                if tokens and sum(1 for w in tokens if w in text) >= max(2, (len(tokens) + 1) // 2):
+                    matched_courses.append((cid, name, len(n)))
+
+        if not matched_courses:
+            return None
+
+        matched_courses.sort(key=lambda x: -x[2])
+        best_len = matched_courses[0][2]
+        top_courses = [m for m in matched_courses if m[2] >= best_len - 2]
+        # یکتا کردن course id
+        course_ids = list({m[0]: m for m in top_courses}.keys())
+
+        # همه ویدیوهای درس‌های کاندید
         c.execute(
             """
             SELECT v.id, v.title, v.episode, c.name, v.telegram_file_id
             FROM videos v
             JOIN courses c ON v.course_id = c.id
-            WHERE v.title = %s
-            LIMIT 2
+            WHERE v.course_id = ANY(%s)
             """,
-            (text,),
+            (course_ids,),
         )
         rows = c.fetchall()
-        if len(rows) == 1:
-            return rows[0]
 
-        # 2) همه عناوین همان درس‌هایی که نامشان در کپشن است + فیلتر قسمت
-        c.execute(
-            """
-            SELECT v.id, v.title, v.episode, c.name, v.telegram_file_id
-            FROM videos v
-            JOIN courses c ON v.course_id = c.id
-            WHERE LENGTH(COALESCE(v.title, '')) >= 8
-            ORDER BY LENGTH(v.title) DESC
-            """
-        )
-        all_rows = c.fetchall()
+        def ep_norm(x: str) -> str:
+            x = normalize_digits(str(x or ""))
+            x = re.sub(r"\s+", "", x).replace("–", "-").replace("/", "-").replace(".", "-")
+            return x
 
-        candidates = []
-        for r in all_rows:
-            title = (r[1] or "").replace("‌", " ")
-            title = normalize_digits(title)
-            title = re.sub(r"\s+", " ", title).strip()
-            if not _title_fits_caption(title, text):
-                continue
-            if ep:
-                row_ep = normalize_digits(str(r[2] or ""))
-                title_ep = _extract_episode_num(title)
-                if row_ep and row_ep != ep and title_ep and title_ep != ep:
-                    continue
-                if row_ep and row_ep != ep and not title_ep:
-                    continue
-            candidates.append(r)
+        target = ep_norm(ep)
+        exact = [r for r in rows if ep_norm(r[2]) == target]
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            exact.sort(
+                key=lambda r: next((m[2] for m in matched_courses if m[1] == r[3]), 0),
+                reverse=True,
+            )
+            return exact[0]
 
-        if len(candidates) == 1:
-            return candidates[0]
-
-        if len(candidates) > 1 and ep:
-            ep_exact = [
-                r
-                for r in candidates
-                if normalize_digits(str(r[2] or "")) == ep
-                or _extract_episode_num(r[1] or "") == ep
-            ]
-            if len(ep_exact) == 1:
-                return ep_exact[0]
-            # بلندترین عنوان بین ep_exact
-            if ep_exact:
-                ep_exact.sort(key=lambda r: len(r[1] or ""), reverse=True)
-                # فقط اگر یکی با همان طول حداکثر یکتا باشد
-                best_len = len(ep_exact[0][1] or "")
-                top = [r for r in ep_exact if len(r[1] or "") == best_len]
-                if len(top) == 1:
-                    return top[0]
+        # عنوان کوتاه DB مثل «قسمت 25»
+        by_title = [
+            r
+            for r in rows
+            if ep_norm(_extract_episode_num(r[1] or "") or "") == target
+            or ep_norm(r[1] or "").endswith(target)
+        ]
+        if len(by_title) == 1:
+            return by_title[0]
+        if len(by_title) > 1:
+            by_title.sort(
+                key=lambda r: next((m[2] for m in matched_courses if m[1] == r[3]), 0),
+                reverse=True,
+            )
+            return by_title[0]
 
     return None
 
@@ -2281,11 +2280,13 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("autolink", autolink_on))
     app.add_handler(CommandHandler("autolink_off", autolink_off))
+    # group=1 تا ConversationHandler (ویرایش/افزودن) اول ویدیو را بگیرد
     app.add_handler(
         MessageHandler(
-            (filters.VIDEO | filters.Document.ALL) & filters.User(list(ADMIN_IDS)),
+            (filters.VIDEO | filters.Document.ALL) & filters.User(list(ADMIN_IDS) or [0]),
             autolink_media,
-        )
+        ),
+        group=1,
     )
     app.add_handler(add_course_conv)
     app.add_handler(edit_course_conv)
