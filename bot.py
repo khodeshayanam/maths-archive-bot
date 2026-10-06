@@ -2122,6 +2122,118 @@ def _start_fake_webserver():
 
 
 
+def parse_course_and_episode_from_caption(caption: str):
+    """از کپشن کانال: (نام_درس، شماره_قسمت، عنوان_کوتاه)."""
+    text = clean_caption_for_match(caption)
+    ep = _extract_episode_num(text)
+    if not ep:
+        return None, None, None
+    # حذف قسمت از انتها
+    course = re.sub(
+        r"\s*[-–—]?\s*(?:قسمت|جلسه)\s*[0-9۰-۹]+(?:\s*[-–./]\s*[0-9۰-۹]+)?\s*$",
+        "",
+        text,
+    ).strip(" -–—|")
+    course = re.sub(r"\s+", " ", course).strip()
+    # عنوان کوتاه مثل Excel تمیز
+    if re.match(r"^\d+[-–./]\d+$", ep.replace(" ", "")):
+        main, part = re.split(r"[-–./]", ep)
+        ordinals = {
+            "1": "اول", "2": "دوم", "3": "سوم", "4": "چهارم", "5": "پنجم",
+            "6": "ششم", "7": "هفتم", "8": "هشتم", "9": "نهم", "10": "دهم",
+        }
+        part_fa = ordinals.get(part, part)
+        title = f"قسمت {main} (بخش {part_fa})"
+    else:
+        title = f"قسمت {ep}"
+    return course or None, ep, title
+
+
+def resolve_or_create_course(course_name: str) -> tuple:
+    """برمی‌گرداند (course_id, course_name_final)."""
+    text = normalize_digits(course_name.replace("‌", " "))
+    text = re.sub(r"\s+", " ", text).strip()
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, name FROM courses")
+        courses = c.fetchall()
+    best = None
+    best_score = 0.0
+    for cid, name in courses:
+        n = normalize_digits((name or "").replace("‌", " "))
+        n = re.sub(r"\s+", " ", n).strip()
+        if not n:
+            continue
+        if n == text or n in text or text in n:
+            score = 1000 + len(n)
+        else:
+            STOP = {"دکتر", "درس", "مبانی", "با", "در", "و", "از", "به", "برای", "های", "ها"}
+            words = [w for w in re.split(r"[\s\-_:/]+", n) if len(w) >= 2 and w not in STOP]
+            if not words:
+                continue
+            hit = [w for w in words if w in text]
+            ratio = len(hit) / len(words) if words else 0
+            if ratio < 0.7:
+                continue
+            score = sum(len(w) for w in hit) * ratio
+        if score > best_score:
+            best_score = score
+            best = (cid, name)
+    if best and best_score >= 5:
+        return best
+    # ساخت درس جدید
+    ok = add_course(text)
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, name FROM courses WHERE name = %s", (text,))
+        row = c.fetchone()
+    if row:
+        return row
+    # ممکن است normalize متفاوت باشد
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, name FROM courses WHERE name ILIKE %s ORDER BY id DESC LIMIT 1", (text,))
+        row = c.fetchone()
+    return row if row else (None, text)
+
+
+def create_video_from_telegram_caption(caption: str, telegram_file_id: str):
+    """
+    وقتی در DB نبود: درس/قسمت از کپشن ساخته می‌شود.
+    namasha_url با پیشوند telegram-only پر می‌شود (اجباری در اسکیما).
+    """
+    course_name, ep, title = parse_course_and_episode_from_caption(caption)
+    if not course_name or not ep:
+        return None
+    resolved = resolve_or_create_course(course_name)
+    if not resolved or not resolved[0]:
+        return None
+    course_id, final_name = resolved
+    placeholder = f"telegram-only:{course_id}:{ep}:{abs(hash(caption)) % 10**10}"
+    ok = add_video(
+        course_id=course_id,
+        title=title,
+        namasha_url=placeholder,
+        episode=ep,
+        download_url=None,
+        telegram_file_id=telegram_file_id,
+    )
+    if not ok:
+        return None
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT v.id, v.title, v.episode, c.name, v.telegram_file_id
+            FROM videos v JOIN courses c ON v.course_id = c.id
+            WHERE v.namasha_url = %s
+            """,
+            (placeholder,),
+        )
+        return c.fetchone()
+
+
+
 async def autolink_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """حالت اتصال فایل تلگرام به ویدیوهای موجود (فقط ادمین)."""
     if not is_admin(update.effective_user.id):
@@ -2129,9 +2241,9 @@ async def autolink_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["autolink"] = True
     await update.message.reply_text(
         "🔗 حالت اتصال فایل روشن شد.\n\n"
-        "ویدیوها را از کانال آرشیو *فوروارد* کن.\n"
-        "ربات فقط ردیف‌های از قبل موجود را پر می‌کند؛ درس/ویدیو جدید نمی‌سازد.\n"
-        ""
+        "ویدیوها را از کانال آرشیو فوروارد کن.\n"
+        "• اگر ردیف از قبل باشد → فقط فایل تلگرام وصل می‌شود.\n"
+        "• اگر در نماشا/دیتابیس نباشد → از روی کپشن درس و قسمت ساخته می‌شود.\n\n"
         "برای خاموش کردن: /autolink_off",
         parse_mode=None,
     )
@@ -2178,11 +2290,19 @@ async def autolink_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"⚠️ خطا در تطبیق: {type(e).__name__}: {e}")
         return
 
+    created_new = False
     if not row:
-        await msg.reply_text(
-            f"❌ در دیتابیس پیدا نشد (چیزی اضافه نشد):\n{cleaned[:120]}"
-        )
-        return
+        try:
+            row = create_video_from_telegram_caption(caption, tg_id)
+            created_new = bool(row)
+        except Exception as e:
+            await msg.reply_text(f"⚠️ خطا در ساخت ردیف جدید: {type(e).__name__}: {e}")
+            return
+        if not row:
+            await msg.reply_text(
+                f"❌ از کپشن درس/قسمت خوانده نشد:\n{cleaned[:120]}"
+            )
+            return
 
     # ممکن است ۶ ستون برگردد (با course_id)
     vid_id = row[0]
@@ -2191,13 +2311,19 @@ async def autolink_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     course_name = row[3]
     old_tg = row[4]
 
-    try:
-        update_video(vid_id, telegram_file_id=tg_id)
-    except Exception as e:
-        await msg.reply_text(f"⚠️ خطا در ذخیره: {type(e).__name__}: {e}")
-        return
+    if not created_new:
+        try:
+            update_video(vid_id, telegram_file_id=tg_id)
+        except Exception as e:
+            await msg.reply_text(f"⚠️ خطا در ذخیره: {type(e).__name__}: {e}")
+            return
 
-    status = "جایگزین شد" if old_tg else "وصل شد"
+    if created_new:
+        status = "اضافه و وصل شد (فقط تلگرام — در نماشا نبود)"
+    elif old_tg:
+        status = "جایگزین شد"
+    else:
+        status = "وصل شد"
     await msg.reply_text(
         f"✅ {status}\n"
         f"درس: {course_name}\n"
