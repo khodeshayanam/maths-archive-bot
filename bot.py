@@ -2172,15 +2172,31 @@ async def autolink_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cleaned = clean_caption_for_match(caption)
 
-    row = find_video_for_autolink(caption)
+    try:
+        row = find_video_for_autolink(caption)
+    except Exception as e:
+        await msg.reply_text(f"⚠️ خطا در تطبیق: {type(e).__name__}: {e}")
+        return
+
     if not row:
         await msg.reply_text(
             f"❌ در دیتابیس پیدا نشد (چیزی اضافه نشد):\n{cleaned[:120]}"
         )
         return
 
-    vid_id, title, episode, course_name, old_tg = row
-    update_video(vid_id, telegram_file_id=tg_id)
+    # ممکن است ۶ ستون برگردد (با course_id)
+    vid_id = row[0]
+    title = row[1]
+    episode = row[2]
+    course_name = row[3]
+    old_tg = row[4]
+
+    try:
+        update_video(vid_id, telegram_file_id=tg_id)
+    except Exception as e:
+        await msg.reply_text(f"⚠️ خطا در ذخیره: {type(e).__name__}: {e}")
+        return
+
     status = "جایگزین شد" if old_tg else "وصل شد"
     await msg.reply_text(
         f"✅ {status}\n"
