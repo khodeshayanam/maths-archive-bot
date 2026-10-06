@@ -459,8 +459,8 @@ def _extract_episode_num(text: str):
 
 def find_video_for_autolink(caption: str):
     """
-    تطبیق با کپشن کانال وقتی عنوان DB کوتاه است (مثل «قسمت 25»):
-    نام درس در کپشن + شماره قسمت.
+    تطبیق: نام درس در کپشن + شماره قسمت.
+    امتیازدهی سخت‌گیرانه تا درس‌های شبیه (روحانی / ناپارامتری) قاطی نشوند.
     """
     text = clean_caption_for_match(caption)
     if not text or len(text) < 5:
@@ -470,43 +470,63 @@ def find_video_for_autolink(caption: str):
     if not ep:
         return None
 
+    STOP = {
+        "دکتر", "درس", "مبانی", "با", "در", "و", "از", "به", "برای",
+        "های", "ها", "یک", "۱", "2", "۲", "قسمت", "جلسه",
+    }
+
+    def toks(name: str):
+        n = normalize_digits((name or "").replace("‌", " "))
+        n = re.sub(r"\s+", " ", n).strip()
+        return [w for w in re.split(r"[\s\-_:/]+", n) if len(w) >= 2 and w not in STOP]
+
+    def score_course(name: str) -> float:
+        """چقدر از نام درس واقعاً داخل کپشن است (۰ تا ۱+ طول)."""
+        n = normalize_digits((name or "").replace("‌", " "))
+        n = re.sub(r"\s+", " ", n).strip()
+        if len(n) < 4:
+            return 0.0
+        # اگر کل نام داخل کپشن باشد بهترین حالت
+        if n in text:
+            return 1000.0 + len(n)
+        words = toks(name)
+        if not words:
+            return 0.0
+        hit = [w for w in words if w in text]
+        if not hit:
+            return 0.0
+        ratio = len(hit) / len(words)
+        # حداقل ۶۰٪ توکن‌های معنادار باید در کپشن باشند
+        if ratio < 0.6:
+            return 0.0
+        # توکن‌های خاص‌تر (بلندتر) وزن بیشتر
+        weight = sum(len(w) for w in hit)
+        return weight * ratio + len(hit) * 0.1
+
     with get_connection() as conn:
         c = conn.cursor()
-
-        # همه درس‌ها — بلندترین نامی که داخل کپشن است
         c.execute("SELECT id, name FROM courses")
         courses = c.fetchall()
-        matched_courses = []
-        for cid, name in courses:
-            n = normalize_digits((name or "").replace("‌", " "))
-            n = re.sub(r"\s+", " ", n).strip()
-            if len(n) < 4:
-                continue
-            if n in text:
-                matched_courses.append((cid, name, len(n)))
-            else:
-                # تطبیق تقریبی: حداقل ۲ توکن معنادار
-                tokens = [
-                    w
-                    for w in re.split(r"\s+", n)
-                    if len(w) >= 3 and w not in ("دکتر", "درس", "مبانی", "با", "در", "و")
-                ]
-                if tokens and sum(1 for w in tokens if w in text) >= max(2, (len(tokens) + 1) // 2):
-                    matched_courses.append((cid, name, len(n)))
 
-        if not matched_courses:
+        scored = []
+        for cid, name in courses:
+            s = score_course(name)
+            if s > 0:
+                scored.append((s, cid, name))
+
+        if not scored:
             return None
 
-        matched_courses.sort(key=lambda x: -x[2])
-        best_len = matched_courses[0][2]
-        top_courses = [m for m in matched_courses if m[2] >= best_len - 2]
-        # یکتا کردن course id
-        course_ids = list({m[0]: m for m in top_courses}.keys())
+        scored.sort(key=lambda x: -x[0])
+        best_score = scored[0][0]
+        # فقط درس‌هایی که امتیازشان نزدیک بهترین است
+        top = [x for x in scored if x[0] >= best_score * 0.85]
+        # اگر چند تا ماند، آن که توکن‌های خاص‌تری در کپشن دارد
+        course_ids = [x[1] for x in top]
 
-        # همه ویدیوهای درس‌های کاندید
         c.execute(
             """
-            SELECT v.id, v.title, v.episode, c.name, v.telegram_file_id
+            SELECT v.id, v.title, v.episode, c.name, v.telegram_file_id, v.course_id
             FROM videos v
             JOIN courses c ON v.course_id = c.id
             WHERE v.course_id = ANY(%s)
@@ -522,32 +542,52 @@ def find_video_for_autolink(caption: str):
 
         target = ep_norm(ep)
         exact = [r for r in rows if ep_norm(r[2]) == target]
-        if len(exact) == 1:
-            return exact[0]
-        if len(exact) > 1:
-            exact.sort(
-                key=lambda r: next((m[2] for m in matched_courses if m[1] == r[3]), 0),
-                reverse=True,
-            )
-            return exact[0]
+        if not exact:
+            exact = [
+                r
+                for r in rows
+                if ep_norm(_extract_episode_num(r[1] or "") or "") == target
+            ]
+        if not exact:
+            return None
 
-        # عنوان کوتاه DB مثل «قسمت 25»
-        by_title = [
-            r
-            for r in rows
-            if ep_norm(_extract_episode_num(r[1] or "") or "") == target
-            or ep_norm(r[1] or "").endswith(target)
-        ]
-        if len(by_title) == 1:
-            return by_title[0]
-        if len(by_title) > 1:
-            by_title.sort(
-                key=lambda r: next((m[2] for m in matched_courses if m[1] == r[3]), 0),
-                reverse=True,
-            )
-            return by_title[0]
+        # بین ویدیوهای هم‌قسمت، درسی با بالاترین score
+        score_by_id = {cid: s for s, cid, _ in scored}
 
-    return None
+        def row_score(r):
+            return score_by_id.get(r[5], 0)
+
+        exact.sort(key=row_score, reverse=True)
+        # اگر دو درس امتیاز نزدیک دارند ولی یکی کلمهٔ متمایز در کپشن دارد
+        best = exact[0]
+        if len(exact) > 1 and row_score(exact[0]) == row_score(exact[1]):
+            # ترجیح نامی که همهٔ توکن‌هایش در کپشن است
+            def full_fit(r):
+                return 1 if score_course(r[3]) >= 1000 else 0
+
+            exact.sort(key=lambda r: (full_fit(r), row_score(r)), reverse=True)
+            best = exact[0]
+        elif len(top) > 1:
+            # اختلاف امتیاز باید واضح باشد؛ وگرنه فقط اگر full name match
+            if best_score < 1000 and scored[0][0] - scored[1][0] < 3:
+                # نیاز به تمایز بیشتر: توکن‌هایی که فقط در یک درس هستند
+                unique_hits = []
+                for s, cid, name in top:
+                    other_words = set()
+                    for s2, cid2, name2 in top:
+                        if cid2 != cid:
+                            other_words |= set(toks(name2))
+                    mine = set(toks(name)) - other_words
+                    unique_in_caption = [w for w in mine if w in text]
+                    unique_hits.append((len(unique_in_caption), s, cid, name))
+                unique_hits.sort(reverse=True)
+                if unique_hits and unique_hits[0][0] > 0:
+                    prefer_cid = unique_hits[0][2]
+                    preferred = [r for r in exact if r[5] == prefer_cid]
+                    if preferred:
+                        return preferred[0]
+        return best
+
 
 
 def search_all(query: str) -> List[Tuple]:
