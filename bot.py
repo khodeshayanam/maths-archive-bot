@@ -124,9 +124,13 @@ def resolve_category_from_callback(data: str, prefix: str) -> tuple:
 
 
 def normalize_digits(text: str) -> str:
+    """ارقام فارسی + یکسان‌سازی ي/ك عربی + حذف اعراب و کشیده."""
     if not text:
         return text
-    return text.translate(PERSIAN_DIGITS)
+    letters = str.maketrans({"ي": "ی", "ى": "ی", "ك": "ک", "ة": "ه"})
+    text = text.translate(PERSIAN_DIGITS).translate(letters)
+    text = re.sub(r"[\u064B-\u065F\u0670\u0640]", "", text)  # اعراب و ـ
+    return text
 
 
 def safe_text(text: str) -> str:
@@ -783,14 +787,22 @@ def paginate_buttons(items, page: int, page_size: int, prefix: str, back_data: s
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Exception while handling an update:", exc_info=context.error)
-    try:
-        if isinstance(update, Update) and update.effective_message:
+    logging.error("Exception while handling an update", exc_info=context.error)
+    err = context.error
+    msg = f"⚠️ {type(err).__name__}: {err}"[:3500]
+    for aid in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=aid, text=msg)
+        except Exception:
+            pass
+    if isinstance(update, Update) and update.effective_message:
+        try:
             await update.effective_message.reply_text(
                 "⚠️ مشکلی پیش آمد. لطفاً دوباره امتحان کنید."
             )
-    except Exception:
-        pass
+        except Exception:
+            pass
+
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1001,10 +1013,14 @@ async def show_course_videos_page(update, context, course_id, page=0, edit=False
         return
     items = []
     for vid_id, title, episode, url, dl, tg in videos:
-        if episode:
-            label = f"🎬 قسمت {episode} — {title}"
+        title_s = (title or "").strip()
+        ep_s = str(episode or "").strip()
+        if ep_s and (title_s.startswith("قسمت") or title_s == f"قسمت {ep_s}"):
+            label = f"🎬 {title_s}" if title_s else f"🎬 قسمت {ep_s}"
+        elif ep_s:
+            label = f"🎬 قسمت {ep_s} — {title_s}" if title_s else f"🎬 قسمت {ep_s}"
         else:
-            label = f"🎬 {title}"
+            label = f"🎬 {title_s}"
         items.append([InlineKeyboardButton(label[:60], callback_data=f"video_{vid_id}")])
     markup, total, start, end = paginate_buttons(
         items, page, PAGE_SIZE, f"cv_{course_id}", back_data=f"course_{course_id}"
@@ -1044,11 +1060,14 @@ async def video_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if episode:
         text += f"📌 قسمت: {safe_text(str(episode))}\n"
     rows = []
-    rows.append([InlineKeyboardButton("▶️ تماشا در نماشا", url=url)])
-    if dl:
+    if url and str(url).startswith(("http://", "https://")):
+        rows.append([InlineKeyboardButton("▶️ تماشا در نماشا", url=url)])
+    if dl and str(dl).startswith(("http://", "https://")):
         rows.append([InlineKeyboardButton("⬇️ دانلود مستقیم", url=dl)])
     if tg_file:
         rows.append([InlineKeyboardButton("📤 دریافت در ربات", callback_data=f"sendvid_{video_id}")])
+    if not rows:
+        text += "\n\nℹ️ این قسمت فقط از طریق فایل تلگرام در دسترس است."
     rows.append([InlineKeyboardButton("🔙 بازگشت به قسمت‌ها", callback_data=f"hub_vid_{course_id}")])
     rows.append([InlineKeyboardButton("📘 صفحه درس", callback_data=f"course_{course_id}")])
     try:
@@ -1056,10 +1075,13 @@ async def video_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML
         )
     except BadRequest:
-        await q.edit_message_text(
-            f"🎬 {title}\n📘 {course_name}",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
+        try:
+            await q.edit_message_text(
+                f"🎬 {title}\n📘 {course_name}",
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+        except BadRequest:
+            await q.answer("به‌روز شد.", show_alert=False)
 
 
 async def send_video_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1586,7 +1608,7 @@ async def admin_delete_video_course(update: Update, context: ContextTypes.DEFAUL
             return ConversationHandler.END
         buttons = []
         for vid_id, title, episode, *_ in videos:
-            label = f"قسمت {episode} — {title}" if episode else title
+            label = title if (title or "").startswith("قسمت") else (f"قسمت {episode} — {title}" if episode else (title or "—"))
             buttons.append(
                 [InlineKeyboardButton(f"🗑 {label}"[:50], callback_data=f"delvid_id_{vid_id}")]
             )
@@ -1655,7 +1677,7 @@ async def admin_edit_video_select(update: Update, context: ContextTypes.DEFAULT_
             return ConversationHandler.END
         buttons = []
         for vid_id, title, episode, *_ in videos:
-            label = f"قسمت {episode} — {title}" if episode else title
+            label = title if (title or "").startswith("قسمت") else (f"قسمت {episode} — {title}" if episode else (title or "—"))
             buttons.append(
                 [InlineKeyboardButton(f"✏️ {label}"[:50], callback_data=f"editvid_id_{vid_id}")]
             )
@@ -2164,8 +2186,11 @@ def resolve_or_create_course(course_name: str) -> tuple:
         n = re.sub(r"\s+", " ", n).strip()
         if not n:
             continue
-        if n == text or n in text or text in n:
+        if n == text or n in text:
             score = 1000 + len(n)
+        elif text in n and len(text) >= max(8, int(len(n) * 0.8)):
+            # فقط اگر متن کپشن تقریباً کل نام درس را پوشش دهد
+            score = 500 + len(text)
         else:
             STOP = {"دکتر", "درس", "مبانی", "با", "در", "و", "از", "به", "برای", "های", "ها"}
             words = [w for w in re.split(r"[\s\-_:/]+", n) if len(w) >= 2 and w not in STOP]
@@ -2209,7 +2234,8 @@ def create_video_from_telegram_caption(caption: str, telegram_file_id: str):
     if not resolved or not resolved[0]:
         return None
     course_id, final_name = resolved
-    placeholder = f"telegram-only:{course_id}:{ep}:{abs(hash(caption)) % 10**10}"
+    digest = hashlib.sha1((caption or "").encode("utf-8")).hexdigest()[:10]
+    placeholder = f"telegram-only:{course_id}:{ep}:{digest}"
     ok = add_video(
         course_id=course_id,
         title=title,
@@ -2462,14 +2488,6 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("autolink", autolink_on))
     app.add_handler(CommandHandler("autolink_off", autolink_off))
-    # group=1 تا ConversationHandler (ویرایش/افزودن) اول ویدیو را بگیرد
-    app.add_handler(
-        MessageHandler(
-            (filters.VIDEO | filters.Document.ALL) & filters.User(list(ADMIN_IDS) or [0]),
-            autolink_media,
-        ),
-        group=1,
-    )
     app.add_handler(add_course_conv)
     app.add_handler(edit_course_conv)
     app.add_handler(delete_course_conv)
@@ -2478,6 +2496,13 @@ def main():
     app.add_handler(edit_video_conv)
     app.add_handler(add_mat_conv)
     app.add_handler(del_mat_conv)
+    # بعد از ConversationHandlerها در group=0 تا وسط ویرایش، autolink نگیرد
+    app.add_handler(
+        MessageHandler(
+            (filters.VIDEO | filters.Document.ALL) & filters.User(list(ADMIN_IDS) or [0]),
+            autolink_media,
+        )
+    )
     app.add_handler(CallbackQueryHandler(course_selected, pattern=r"^course_\d+$"))
     app.add_handler(CallbackQueryHandler(courses_page_callback, pattern=r"^courses_page_\d+$"))
     app.add_handler(CallbackQueryHandler(hub_videos, pattern=r"^hub_vid_\d+$"))
