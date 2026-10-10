@@ -27,7 +27,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError
 
 load_dotenv()
 
@@ -36,6 +36,9 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+# جلوگیری از لاگ شدن URLهای حاوی توکن در خروجی Render/Railway
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
@@ -787,8 +790,13 @@ def paginate_buttons(items, page: int, page_size: int, prefix: str, back_data: s
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logging.error("Exception while handling an update", exc_info=context.error)
     err = context.error
+    logger.error("Exception while handling an update", exc_info=err)
+    # خطاهای موقت شبکه و «پیام تغییر نکرد» را برای ادمین اسپم نکن
+    if isinstance(err, NetworkError):
+        return
+    if isinstance(err, BadRequest) and "not modified" in str(err).lower():
+        return
     msg = f"⚠️ {type(err).__name__}: {err}"[:3500]
     for aid in ADMIN_IDS:
         try:
@@ -2207,7 +2215,7 @@ def resolve_or_create_course(course_name: str) -> tuple:
     if best and best_score >= 5:
         return best
     # ساخت درس جدید
-    ok = add_course(text)
+    add_course(text)
     with get_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT id, name FROM courses WHERE name = %s", (text,))
