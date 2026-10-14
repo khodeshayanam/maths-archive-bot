@@ -142,6 +142,44 @@ def safe_text(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def truncate_btn(text: str, max_bytes: int = 60) -> str:
+    """برش متن دکمه روی مرز بایت UTF-8 (محدودیت تلگرام)."""
+    if not text:
+        return ""
+    raw = str(text)
+    if len(raw.encode("utf-8")) <= max_bytes:
+        return raw
+    s = raw
+    while s and len(s.encode("utf-8")) > max_bytes - 1:
+        s = s[:-1]
+    return s + "…"
+
+
+def is_telegram_video_message(msg) -> bool:
+    if not msg:
+        return False
+    if msg.video:
+        return True
+    doc = getattr(msg, "document", None)
+    if not doc:
+        return False
+    mime = (doc.mime_type or "").lower()
+    name = (doc.file_name or "").lower()
+    if mime.startswith("video/"):
+        return True
+    return name.endswith((".mp4", ".mkv", ".webm", ".mov", ".avi"))
+
+
+def extract_telegram_video_file_id(msg):
+    if not msg:
+        return None
+    if msg.video:
+        return msg.video.file_id
+    if msg.document and is_telegram_video_message(msg):
+        return msg.document.file_id
+    return None
+
+
 def is_valid_namasha_url(url: str) -> bool:
     if not url:
         return False
@@ -258,6 +296,12 @@ def init_db():
                 c.execute(f"ALTER TABLE videos ADD COLUMN IF NOT EXISTS {col} {typ}")
             except Exception:
                 pass
+        try:
+            c.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_videos_namasha_url ON videos (namasha_url)"
+            )
+        except Exception as e:
+            logger.warning("unique index namasha_url: %s", e)
 
 
 def is_admin(user_id: int) -> bool:
@@ -271,7 +315,7 @@ def add_course(name: str, teacher: str = None) -> bool:
             c = conn.cursor()
             c.execute(
                 "INSERT INTO courses (name, teacher, created_at) VALUES (%s, %s, %s)",
-                (name.strip(), teacher, datetime.now().isoformat()),
+                (normalize_digits(name.strip()), teacher, datetime.now().isoformat()),
             )
         return True
     except psycopg.errors.IntegrityError:
@@ -600,6 +644,8 @@ def find_video_for_autolink(caption: str):
 def search_all(query: str) -> List[Tuple]:
     """Search videos: returns (vid_id, title, episode, course_name)"""
     q = normalize_digits(query.strip())
+    # escape ILIKE wildcards
+    q = q.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
     like = f"%{q}%"
     with get_connection() as conn:
         c = conn.cursor()
@@ -917,7 +963,7 @@ async def show_courses_page(update, context, page=0, edit=False):
         label = f"📘 {name}"
         if teacher:
             label += f" ({teacher})"
-        items.append([InlineKeyboardButton(label[:60], callback_data=f"course_{course_id}")])
+        items.append([InlineKeyboardButton(truncate_btn(label), callback_data=f"course_{course_id}")])
     markup, total, start, end = paginate_buttons(items, page, PAGE_SIZE, "courses")
     text = (
         f"📚 <b>لیست دروس</b>\n"
@@ -1029,7 +1075,7 @@ async def show_course_videos_page(update, context, course_id, page=0, edit=False
             label = f"🎬 قسمت {ep_s} — {title_s}" if title_s else f"🎬 قسمت {ep_s}"
         else:
             label = f"🎬 {title_s}"
-        items.append([InlineKeyboardButton(label[:60], callback_data=f"video_{vid_id}")])
+        items.append([InlineKeyboardButton(truncate_btn(label), callback_data=f"video_{vid_id}")])
     markup, total, start, end = paginate_buttons(
         items, page, PAGE_SIZE, f"cv_{course_id}", back_data=f"course_{course_id}"
     )
@@ -1180,18 +1226,25 @@ async def material_category_selected(update: Update, context: ContextTypes.DEFAU
     await show_material_list(update, context, course_id, section, category)
 
 
-async def show_material_list(update, context, course_id, section, category):
+async def show_material_list(update, context, course_id, section, category, page=0):
     course = get_course_by_id(course_id)
     items = get_materials(course_id, section, category)
     label = SECTION_LABELS.get(section, section)
+    back = f"hub_mat_{course_id}" if section == SECTION_MATERIALS else f"hub_exam_{course_id}"
     if not items:
         text = f"موردی در «{safe_text(category)}» نیست."
         kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔙 بازگشت", callback_data=f"hub_mat_{course_id}" if section == SECTION_MATERIALS else f"hub_exam_{course_id}")]]
+            [[InlineKeyboardButton("🔙 بازگشت", callback_data=back)]]
         )
-        await update.callback_query.edit_message_text(text, reply_markup=kb)
+        try:
+            await update.callback_query.edit_message_text(text, reply_markup=kb)
+        except BadRequest:
+            await update.callback_query.answer()
         return
-    buttons = []
+    context.user_data["mat_list_cat"] = category
+    context.user_data["mat_list_section"] = section
+    context.user_data["mat_list_course"] = course_id
+    btns = []
     for mid, title, file_id, file_type, caption in items:
         if title:
             name = title
@@ -1200,20 +1253,41 @@ async def show_material_list(update, context, course_id, section, category):
         else:
             name = "📷 عکس" if file_type == "photo" else "📄 فایل"
         icon = "🖼" if file_type == "photo" else "📄"
-        buttons.append(
-            [InlineKeyboardButton(f"{icon} {name}"[:60], callback_data=f"mfile_{mid}")]
+        btns.append(
+            [InlineKeyboardButton(truncate_btn(f"{icon} {name}"), callback_data=f"mfile_{mid}")]
         )
-    back = f"hub_mat_{course_id}" if section == SECTION_MATERIALS else f"hub_exam_{course_id}"
-    buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data=back)])
+    sec_key = "m" if section == SECTION_MATERIALS else "e"
+    markup, total, start, end = paginate_buttons(
+        btns, page, PAGE_SIZE, f"mlpg_{course_id}_{sec_key}", back_data=back
+    )
+    cname = course[1] if course else ""
     text = (
         f"{label}\n"
         f"📁 <b>{safe_text(category)}</b>\n"
-        f"📘 {safe_text(course[1])}\n\n"
-        "یک مورد را انتخاب کنید:"
+        f"📘 {safe_text(cname)}\n\n"
+        f"نمایش {start+1} تا {min(end, total)} از {total}"
     )
-    await update.callback_query.edit_message_text(
-        text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML
-    )
+    try:
+        await update.callback_query.edit_message_text(
+            text, reply_markup=markup, parse_mode=ParseMode.HTML
+        )
+    except BadRequest:
+        await update.callback_query.answer()
+
+
+async def material_list_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    parts = q.data.split("_")
+    course_id = int(parts[1])
+    page = int(parts[-1])
+    sec_key = parts[2] if len(parts) > 2 else "m"
+    section = SECTION_MATERIALS if sec_key == "m" else "exams"
+    category = context.user_data.get("mat_list_cat")
+    if not category:
+        await q.edit_message_text("دوباره از صفحه درس وارد شوید.")
+        return
+    await show_material_list(update, context, course_id, section, category, page=page)
 
 
 async def send_material_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1266,6 +1340,7 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🆕 آخرین ویدیوها",
         "📖 راهنما",
         "⚙️ پنل مدیریت",
+        "📊 آمار",
     }
     if query in menu:
         context.user_data["waiting_search"] = False
@@ -1284,7 +1359,7 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label = f"{course_name} | قسمت {episode}"
         else:
             label = f"{course_name} — {title}"
-        buttons.append([InlineKeyboardButton(label[:60], callback_data=f"video_{vid_id}")])
+        buttons.append([InlineKeyboardButton(truncate_btn(label), callback_data=f"video_{vid_id}")])
     await update.message.reply_text(
         f"🔎 نتایج «{safe_text(query)}»:",
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -1304,7 +1379,7 @@ async def latest_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label = f"{course_name} | قسمت {episode}"
         else:
             label = f"{course_name} — {title}"
-        buttons.append([InlineKeyboardButton(label[:60], callback_data=f"video_{vid_id}")])
+        buttons.append([InlineKeyboardButton(truncate_btn(label), callback_data=f"video_{vid_id}")])
     await update.message.reply_text(
         "🆕 <b>آخرین ویدیوها</b>",
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -1494,6 +1569,9 @@ async def admin_add_video_course(update: Update, context: ContextTypes.DEFAULT_T
     course_id = int(q.data.split("_")[2])
     context.user_data["add_video_course_id"] = course_id
     course = get_course_by_id(course_id)
+    if not course:
+        await q.edit_message_text("درس پیدا نشد.")
+        return ConversationHandler.END
     await q.edit_message_text(
         f"درس: <b>{safe_text(course[1])}</b>\n\nعنوان ویدیو را بفرستید (مثال: قسمت ۲):",
         parse_mode=ParseMode.HTML,
@@ -1559,13 +1637,12 @@ async def admin_add_video_tg(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("یا ویدیو بفرستید یا بنویسید: رد")
             return ADD_VIDEO_TG
     else:
-        tg_id = None
-        if update.message.video:
-            tg_id = update.message.video.file_id
-        elif update.message.document:
-            tg_id = update.message.document.file_id
-        else:
-            await update.message.reply_text("فایل ویدیو یا «رد» بفرستید.")
+        tg_id = extract_telegram_video_file_id(update.message)
+        if not tg_id:
+            await update.message.reply_text(
+                "فقط فایل ویدیو (mp4/mkv/webm) یا بنویسید: رد\n"
+                "PDF یا عکس به‌عنوان ویدیو قبول نمی‌شود."
+            )
             return ADD_VIDEO_TG
 
     ok = add_video(
@@ -1608,19 +1685,31 @@ async def admin_delete_video_start(update: Update, context: ContextTypes.DEFAULT
 async def admin_delete_video_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if q.data.startswith("delvid_course_"):
-        course_id = int(q.data.split("_")[2])
+    if q.data.startswith("delvid_course_") or q.data.startswith("delvidp_"):
+        if q.data.startswith("delvidp_"):
+            parts = q.data.split("_")
+            course_id = int(parts[1])
+            page = int(parts[-1])
+        else:
+            course_id = int(q.data.split("_")[2])
+            page = 0
         videos = get_videos_by_course(course_id)
         if not videos:
             await q.edit_message_text("ویدیویی نیست.")
             return ConversationHandler.END
-        buttons = []
+        items = []
         for vid_id, title, episode, *_ in videos:
             label = title if (title or "").startswith("قسمت") else (f"قسمت {episode} — {title}" if episode else (title or "—"))
-            buttons.append(
-                [InlineKeyboardButton(f"🗑 {label}"[:50], callback_data=f"delvid_id_{vid_id}")]
+            items.append(
+                [InlineKeyboardButton(truncate_btn(f"🗑 {label}", 50), callback_data=f"delvid_id_{vid_id}")]
             )
-        await q.edit_message_text("ویدیو:", reply_markup=InlineKeyboardMarkup(buttons))
+        markup, total, start, end = paginate_buttons(
+            items, page, PAGE_SIZE, f"delvidp_{course_id}"
+        )
+        await q.edit_message_text(
+            f"ویدیو برای حذف (نمایش {start+1} تا {min(end, total)} از {total}):",
+            reply_markup=markup,
+        )
         return DELETE_VIDEO_SELECT
     if q.data.startswith("delvid_id_"):
         video_id = int(q.data.split("_")[2])
@@ -1677,19 +1766,31 @@ async def admin_edit_video_start(update: Update, context: ContextTypes.DEFAULT_T
 async def admin_edit_video_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if q.data.startswith("editvid_course_"):
-        course_id = int(q.data.split("_")[2])
+    if q.data.startswith("editvid_course_") or q.data.startswith("editvidp_"):
+        if q.data.startswith("editvidp_"):
+            parts = q.data.split("_")
+            course_id = int(parts[1])
+            page = int(parts[-1])
+        else:
+            course_id = int(q.data.split("_")[2])
+            page = 0
         videos = get_videos_by_course(course_id)
         if not videos:
             await q.edit_message_text("ویدیویی نیست.")
             return ConversationHandler.END
-        buttons = []
+        items = []
         for vid_id, title, episode, *_ in videos:
             label = title if (title or "").startswith("قسمت") else (f"قسمت {episode} — {title}" if episode else (title or "—"))
-            buttons.append(
-                [InlineKeyboardButton(f"✏️ {label}"[:50], callback_data=f"editvid_id_{vid_id}")]
+            items.append(
+                [InlineKeyboardButton(truncate_btn(f"✏️ {label}", 50), callback_data=f"editvid_id_{vid_id}")]
             )
-        await q.edit_message_text("ویدیو:", reply_markup=InlineKeyboardMarkup(buttons))
+        markup, total, start, end = paginate_buttons(
+            items, page, PAGE_SIZE, f"editvidp_{course_id}"
+        )
+        await q.edit_message_text(
+            f"ویدیو برای ویرایش (نمایش {start+1} تا {min(end, total)} از {total}):",
+            reply_markup=markup,
+        )
         return EDIT_VIDEO_SELECT
     if q.data.startswith("editvid_id_"):
         video_id = int(q.data.split("_")[2])
@@ -1760,13 +1861,12 @@ async def admin_edit_video_value(update: Update, context: ContextTypes.DEFAULT_T
                 return ConversationHandler.END
             await update.message.reply_text("ویدیو بفرستید یا «حذف».")
             return EDIT_VIDEO_VALUE
-        tg_id = None
-        if update.message.video:
-            tg_id = update.message.video.file_id
-        elif update.message.document:
-            tg_id = update.message.document.file_id
+        tg_id = extract_telegram_video_file_id(update.message)
         if not tg_id:
-            await update.message.reply_text("فایل معتبر نیست.")
+            await update.message.reply_text(
+                "فقط فایل ویدیو (mp4/mkv/webm) معتبر است.\n"
+                "PDF یا عکس قبول نمی‌شود."
+            )
             return EDIT_VIDEO_VALUE
         update_video(video_id, telegram_file_id=tg_id)
         await update.message.reply_text("✅ فایل تلگرام ذخیره شد.", reply_markup=admin_keyboard())
@@ -1990,7 +2090,7 @@ async def _show_del_mat_page(update, context, course_id, section, page=0, edit=T
     for mid, cat, title, ftype in rows:
         label = f"{cat} — {title or ftype}"
         items.append(
-            [InlineKeyboardButton(f"🗑 {label}"[:50], callback_data=f"dmat_i_{mid}")]
+            [InlineKeyboardButton(truncate_btn(f"🗑 {label}", 50), callback_data=f"dmat_i_{mid}")]
         )
     markup, total, start, end = paginate_buttons(
         items, page, PAGE_SIZE, f"dmatp_{course_id}_{section[:1]}"
@@ -2373,6 +2473,8 @@ def main():
     if not DATABASE_URL:
         print("❌ DATABASE_URL تنظیم نشده.")
         return
+    if not ADMIN_IDS:
+        print("⚠️ ADMIN_IDS خالی است؛ پنل ادمین برای کسی فعال نمی‌شود.")
     init_db()
     print("✅ PostgreSQL آماده است.")
 
@@ -2438,7 +2540,7 @@ def main():
     delete_video_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🗑 حذف ویدیو$"), admin_delete_video_start)],
         states={
-            DELETE_VIDEO_SELECT: [CallbackQueryHandler(admin_delete_video_course, pattern=r"^delvid_")],
+            DELETE_VIDEO_SELECT: [CallbackQueryHandler(admin_delete_video_course, pattern=r"^(delvid_|delvidp_)")],
             DELETE_VIDEO_CONFIRM: [CallbackQueryHandler(admin_delete_video_confirm, pattern=r"^delvid_confirm_")],
         },
         fallbacks=fb,
@@ -2447,7 +2549,7 @@ def main():
     edit_video_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^✏️ ویرایش ویدیو$"), admin_edit_video_start)],
         states={
-            EDIT_VIDEO_SELECT: [CallbackQueryHandler(admin_edit_video_select, pattern=r"^editvid_")],
+            EDIT_VIDEO_SELECT: [CallbackQueryHandler(admin_edit_video_select, pattern=r"^(editvid_|editvidp_)")],
             EDIT_VIDEO_FIELD: [CallbackQueryHandler(admin_edit_video_field, pattern=r"^editvid_field_")],
             EDIT_VIDEO_VALUE: [
                 MessageHandler(filters.VIDEO | filters.Document.ALL, admin_edit_video_value),
@@ -2520,6 +2622,7 @@ def main():
     app.add_handler(CallbackQueryHandler(video_selected, pattern=r"^video_\d+$"))
     app.add_handler(CallbackQueryHandler(send_video_file, pattern=r"^sendvid_\d+$"))
     app.add_handler(CallbackQueryHandler(material_category_selected, pattern=r"^mcat_"))
+    app.add_handler(CallbackQueryHandler(material_list_page_callback, pattern=r"^mlpg_"))
     app.add_handler(CallbackQueryHandler(send_material_file, pattern=r"^mfile_\d+$"))
     app.add_handler(CallbackQueryHandler(back_to_courses, pattern=r"^back_courses$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
