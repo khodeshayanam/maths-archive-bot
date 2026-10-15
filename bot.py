@@ -336,10 +336,9 @@ def update_course(course_id: int, name: str) -> bool:
 
 
 def delete_course(course_id: int) -> bool:
+    """حذف درس؛ ویدیو و جزوه با ON DELETE CASCADE پاک می‌شوند."""
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute("DELETE FROM materials WHERE course_id = %s", (course_id,))
-        c.execute("DELETE FROM videos WHERE course_id = %s", (course_id,))
         c.execute("DELETE FROM courses WHERE id = %s", (course_id,))
         return c.rowcount > 0
 
@@ -1203,7 +1202,7 @@ async def show_material_categories(update, context, course_id, section):
     buttons = [
         [
             InlineKeyboardButton(
-                f"📁 {cat}",
+                truncate_btn(f"📁 {cat}"),
                 callback_data=pack_category_callback("mcat", course_id, section, cat),
             )
         ]
@@ -1452,7 +1451,7 @@ async def admin_edit_course_start(update: Update, context: ContextTypes.DEFAULT_
     if not courses:
         await update.message.reply_text("درسی وجود ندارد.", reply_markup=admin_keyboard())
         return ConversationHandler.END
-    buttons = [[InlineKeyboardButton(n, callback_data=f"editcourse_{i}")] for i, n, _ in courses]
+    buttons = [[InlineKeyboardButton(truncate_btn(n), callback_data=f"editcourse_{i}")] for i, n, _ in courses]
     await update.message.reply_text(
         "درس را برای ویرایش انتخاب کنید:\nبرای لغو: /cancel یا «🏠 منوی اصلی»",
         reply_markup=ReplyKeyboardRemove(),
@@ -1499,7 +1498,7 @@ async def admin_delete_course_start(update: Update, context: ContextTypes.DEFAUL
     if not courses:
         await update.message.reply_text("درسی نیست.", reply_markup=admin_keyboard())
         return ConversationHandler.END
-    buttons = [[InlineKeyboardButton(f"🗑 {n}", callback_data=f"delcourse_{i}")] for i, n, _ in courses]
+    buttons = [[InlineKeyboardButton(truncate_btn(f"🗑 {n}"), callback_data=f"delcourse_{i}")] for i, n, _ in courses]
     await update.message.reply_text(
         "درس برای حذف:\n⚠️ ویدیوها و جزوات هم پاک می‌شوند.\nلغو: /cancel",
         reply_markup=ReplyKeyboardRemove(),
@@ -1554,7 +1553,7 @@ async def admin_add_video_start(update: Update, context: ContextTypes.DEFAULT_TY
     if not courses:
         await update.message.reply_text("اول درس اضافه کنید.", reply_markup=admin_keyboard())
         return ConversationHandler.END
-    buttons = [[InlineKeyboardButton(n, callback_data=f"addvid_course_{i}")] for i, n, _ in courses]
+    buttons = [[InlineKeyboardButton(truncate_btn(n), callback_data=f"addvid_course_{i}")] for i, n, _ in courses]
     await update.message.reply_text(
         "درس ویدیو را انتخاب کنید:\nلغو: /cancel یا «🏠 منوی اصلی»",
         reply_markup=ReplyKeyboardRemove(),
@@ -1673,7 +1672,7 @@ async def admin_delete_video_start(update: Update, context: ContextTypes.DEFAULT
     if not courses:
         await update.message.reply_text("درسی نیست.", reply_markup=admin_keyboard())
         return ConversationHandler.END
-    buttons = [[InlineKeyboardButton(n, callback_data=f"delvid_course_{i}")] for i, n, _ in courses]
+    buttons = [[InlineKeyboardButton(truncate_btn(n), callback_data=f"delvid_course_{i}")] for i, n, _ in courses]
     await update.message.reply_text(
         "درس را انتخاب کنید:\nلغو: /cancel",
         reply_markup=ReplyKeyboardRemove(),
@@ -1754,7 +1753,7 @@ async def admin_edit_video_start(update: Update, context: ContextTypes.DEFAULT_T
     if not courses:
         await update.message.reply_text("درسی نیست.", reply_markup=admin_keyboard())
         return ConversationHandler.END
-    buttons = [[InlineKeyboardButton(n, callback_data=f"editvid_course_{i}")] for i, n, _ in courses]
+    buttons = [[InlineKeyboardButton(truncate_btn(n), callback_data=f"editvid_course_{i}")] for i, n, _ in courses]
     await update.message.reply_text(
         "درس را انتخاب کنید:\nلغو: /cancel",
         reply_markup=ReplyKeyboardRemove(),
@@ -2055,7 +2054,7 @@ async def admin_del_mat_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not courses:
         await update.message.reply_text("درسی نیست.", reply_markup=admin_keyboard())
         return ConversationHandler.END
-    buttons = [[InlineKeyboardButton(n, callback_data=f"dmat_c_{i}")] for i, n, _ in courses]
+    buttons = [[InlineKeyboardButton(truncate_btn(n), callback_data=f"dmat_c_{i}")] for i, n, _ in courses]
     await update.message.reply_text(
         "درس را انتخاب کنید:\nلغو: /cancel",
         reply_markup=ReplyKeyboardRemove(),

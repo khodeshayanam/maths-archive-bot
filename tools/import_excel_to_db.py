@@ -97,6 +97,7 @@ def insert_video(
             INSERT INTO videos
             (course_id, title, episode, namasha_url, download_url, telegram_file_id, created_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (namasha_url) DO NOTHING
             """,
             (
                 course_id,
