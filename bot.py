@@ -41,7 +41,25 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+
+
+def parse_admin_ids(raw: str) -> List[int]:
+    ids = []
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            user_id = int(item)
+        except ValueError:
+            logger.warning("Ignoring invalid ADMIN_IDS value: %r", item)
+            continue
+        if user_id > 0 and user_id not in ids:
+            ids.append(user_id)
+    return ids
+
+
+ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 PAGE_SIZE = 10
@@ -292,16 +310,19 @@ def init_db():
             ("download_url", "TEXT"),
             ("telegram_file_id", "TEXT"),
         ]:
-            try:
-                c.execute(f"ALTER TABLE videos ADD COLUMN IF NOT EXISTS {col} {typ}")
-            except Exception:
-                pass
+            c.execute(f"ALTER TABLE videos ADD COLUMN IF NOT EXISTS {col} {typ}")
+        # An old database may already contain duplicate URLs. Keep those rows and
+        # let the bot run; the importer still uses ON CONFLICT DO NOTHING.
+        c.execute("SAVEPOINT create_video_url_index")
         try:
             c.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ux_videos_namasha_url ON videos (namasha_url)"
             )
-        except Exception as e:
+        except psycopg.Error as e:
+            c.execute("ROLLBACK TO SAVEPOINT create_video_url_index")
             logger.warning("unique index namasha_url: %s", e)
+        finally:
+            c.execute("RELEASE SAVEPOINT create_video_url_index")
 
 
 def is_admin(user_id: int) -> bool:
@@ -507,6 +528,17 @@ def _extract_episode_num(text: str):
     return ep
 
 
+class AmbiguousAutolinkMatch(Exception):
+    """Caption matches more than one course and must not be guessed."""
+
+
+class MissingAutolinkEpisode(Exception):
+    """The course is known, but this episode has not been added yet."""
+
+    def __init__(self, course_id: int):
+        self.course_id = course_id
+
+
 def find_video_for_autolink(caption: str):
     """
     تطبیق: نام درس در کپشن + شماره قسمت.
@@ -607,36 +639,42 @@ def find_video_for_autolink(caption: str):
         def row_score(r):
             return score_by_id.get(r[5], 0)
 
-        exact.sort(key=row_score, reverse=True)
-        # اگر دو درس امتیاز نزدیک دارند ولی یکی کلمهٔ متمایز در کپشن دارد
-        best = exact[0]
-        if len(exact) > 1 and row_score(exact[0]) == row_score(exact[1]):
-            # ترجیح نامی که همهٔ توکن‌هایش در کپشن است
-            def full_fit(r):
-                return 1 if score_course(r[3]) >= 1000 else 0
+        # If no exact episode exists, do not let autolink create a duplicate
+        # course when the caption could refer to several similarly named ones.
+        if not exact and len(top) > 1 and best_score < 1000 and scored[0][0] - scored[1][0] < 3:
+            raise AmbiguousAutolinkMatch
+        if not exact:
+            if scored:
+                raise MissingAutolinkEpisode(scored[0][1])
+            return None
 
-            exact.sort(key=lambda r: (full_fit(r), row_score(r)), reverse=True)
-            best = exact[0]
-        elif len(top) > 1:
-            # اختلاف امتیاز باید واضح باشد؛ وگرنه فقط اگر full name match
-            if best_score < 1000 and scored[0][0] - scored[1][0] < 3:
-                # نیاز به تمایز بیشتر: توکن‌هایی که فقط در یک درس هستند
-                unique_hits = []
-                for s, cid, name in top:
-                    other_words = set()
-                    for s2, cid2, name2 in top:
-                        if cid2 != cid:
-                            other_words |= set(toks(name2))
-                    mine = set(toks(name)) - other_words
-                    unique_in_caption = [w for w in mine if w in text]
-                    unique_hits.append((len(unique_in_caption), s, cid, name))
-                unique_hits.sort(reverse=True)
-                if unique_hits and unique_hits[0][0] > 0:
-                    prefer_cid = unique_hits[0][2]
-                    preferred = [r for r in exact if r[5] == prefer_cid]
-                    if preferred:
-                        return preferred[0]
-        return best
+        exact.sort(key=lambda r: (row_score(r), -r[0]), reverse=True)
+        course_scores = {}
+        for row in exact:
+            course_scores[row[5]] = max(course_scores.get(row[5], 0), row_score(row))
+        ranked_courses = sorted(course_scores.items(), key=lambda item: item[1], reverse=True)
+        if len(ranked_courses) > 1 and ranked_courses[0][1] - ranked_courses[1][1] < 3:
+            candidate_names = {cid: name for _, cid, name in top}
+            unique_hits = []
+            candidate_ids = [cid for cid, _ in ranked_courses]
+            for cid in candidate_ids:
+                mine = set(toks(candidate_names.get(cid, "")))
+                others = set().union(*(set(toks(candidate_names.get(other, ""))) for other in candidate_ids if other != cid))
+                hit_count = sum(1 for word in mine - others if word in text)
+                unique_hits.append((hit_count, cid))
+            unique_hits.sort(reverse=True)
+            if not unique_hits or unique_hits[0][0] == 0 or (
+                len(unique_hits) > 1 and unique_hits[0][0] == unique_hits[1][0]
+            ):
+                raise AmbiguousAutolinkMatch
+            selected_course = unique_hits[0][1]
+            exact = [row for row in exact if row[5] == selected_course]
+        elif len(ranked_courses) > 1:
+            selected_course = ranked_courses[0][0]
+            exact = [row for row in exact if row[5] == selected_course]
+
+        # Multiple duplicate records in the same course/episode are stable by id.
+        return min(exact, key=lambda row: row[0])
 
 
 
@@ -2329,7 +2367,9 @@ def resolve_or_create_course(course_name: str) -> tuple:
     return row if row else (None, text)
 
 
-def create_video_from_telegram_caption(caption: str, telegram_file_id: str):
+def create_video_from_telegram_caption(
+    caption: str, telegram_file_id: str, course_id: int = None
+):
     """
     وقتی در DB نبود: درس/قسمت از کپشن ساخته می‌شود.
     namasha_url با پیشوند telegram-only پر می‌شود (اجباری در اسکیما).
@@ -2337,10 +2377,16 @@ def create_video_from_telegram_caption(caption: str, telegram_file_id: str):
     course_name, ep, title = parse_course_and_episode_from_caption(caption)
     if not course_name or not ep:
         return None
-    resolved = resolve_or_create_course(course_name)
-    if not resolved or not resolved[0]:
-        return None
-    course_id, final_name = resolved
+    if course_id is None:
+        resolved = resolve_or_create_course(course_name)
+        if not resolved or not resolved[0]:
+            return None
+        course_id, final_name = resolved
+    else:
+        course = get_course_by_id(course_id)
+        if not course:
+            return None
+        final_name = course[1]
     digest = hashlib.sha1((caption or "").encode("utf-8")).hexdigest()[:10]
     placeholder = f"telegram-only:{course_id}:{ep}:{digest}"
     ok = add_video(
@@ -2417,8 +2463,18 @@ async def autolink_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cleaned = clean_caption_for_match(caption)
 
+    matched_course_id = None
+    row = None
     try:
         row = find_video_for_autolink(caption)
+    except AmbiguousAutolinkMatch:
+        await msg.reply_text(
+            "⚠️ این کپشن با بیش از یک درس جور درمی‌آید؛ چیزی تغییر نکرد. "
+            "نام کامل درس را در کپشن مشخص کنید و دوباره بفرستید."
+        )
+        return
+    except MissingAutolinkEpisode as e:
+        matched_course_id = e.course_id
     except Exception as e:
         await msg.reply_text(f"⚠️ خطا در تطبیق: {type(e).__name__}: {e}")
         return
@@ -2426,7 +2482,9 @@ async def autolink_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     created_new = False
     if not row:
         try:
-            row = create_video_from_telegram_caption(caption, tg_id)
+            row = create_video_from_telegram_caption(
+                caption, tg_id, course_id=matched_course_id
+            )
             created_new = bool(row)
         except Exception as e:
             await msg.reply_text(f"⚠️ خطا در ساخت ردیف جدید: {type(e).__name__}: {e}")

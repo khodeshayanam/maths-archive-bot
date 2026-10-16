@@ -97,7 +97,7 @@ def insert_video(
             INSERT INTO videos
             (course_id, title, episode, namasha_url, download_url, telegram_file_id, created_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (namasha_url) DO NOTHING
+            ON CONFLICT DO NOTHING
             """,
             (
                 course_id,
@@ -109,6 +109,7 @@ def insert_video(
                 datetime.now().isoformat(),
             ),
         )
+        return cur.rowcount > 0
 
 
 def main() -> int:
@@ -183,7 +184,7 @@ def main() -> int:
                 continue
             course_id = get_or_create_course(conn, row["course"])
             courses_seen.add(row["course"])
-            insert_video(
+            inserted = insert_video(
                 conn,
                 course_id,
                 row["title"] or row["url"],
@@ -191,7 +192,10 @@ def main() -> int:
                 row["url"],
                 row["download"],
             )
-            added += 1
+            if inserted:
+                added += 1
+            else:
+                skipped += 1
             if i % 50 == 0:
                 conn.commit()
                 print(f"  ... {i}/{len(data)} (اضافه: {added}, رد تکراری: {skipped})")
