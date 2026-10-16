@@ -630,8 +630,6 @@ def find_video_for_autolink(caption: str):
                 for r in rows
                 if ep_norm(_extract_episode_num(r[1] or "") or "") == target
             ]
-        if not exact:
-            return None
 
         # بین ویدیوهای هم‌قسمت، درسی با بالاترین score
         score_by_id = {cid: s for s, cid, _ in scored}
